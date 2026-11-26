@@ -15,7 +15,9 @@
 
 **八次修订（Evidence Integrity Closure）**：① `token_fp` 改为 `system_events` 独立列并接入真实 `INSERT` 与 β′ 校验；② `tx_local` 拆到 `migration_tx_notes`，消除与 DDL 的 3 列 INSERT 冲突；③ `write_event` 在 `BEGIN IMMEDIATE` 内做 C1–C8 全链校验后再追加；④ 路径 α/β′ 均在 `set_phase` 前执行 `hist_gate`（`s5_failed_ever` 永久禁止 T7/T8）。改动点见 §0.7。
 
-**十五次修订（Final Consistency Correction）**：§3.3 拆为 A 类"维护态直接读取者"（应用写入/后台任务/CLI/`write_guard`/重启恢复，共用 `MAINT_FILE` + `verify_maintenance()`）与 B 类"次级封锁机制"（连接池 `dead`、`halt_tail` 用已验证状态、库层约束兜底，**不读文件**）；MC66 按四部分拆分验证。改动点见 §0.10。
+**十六次修订（Final Design Correction）**：`verify_maintenance` 拆为两个职责——`maintenance_state()` 返回 `ACTIVE`/`INACTIVE`/`RECOVERY_REQUIRED` 三态（唯一判定入口，内含唯一一份 `migration_incomplete()` 查询），`confirm_maint_write()` 只做“本次 halt 写出那份是否落盘”的确认；文件缺失不再走“缺失即正常”短路，必须经 DB 查询才可能得 `INACTIVE`。改动点见 §0.10。
+
+**十五次修订（Final Consistency Correction）**：§3.3 拆为 A 类"维护态直接读取者"（应用写入/后台任务/CLI/`write_guard`/重启恢复，共用 `MAINT_FILE` + 统一判定入口（当时为 `verify_maintenance()`，十六次拆为 `maintenance_state()` / `confirm_maint_write()`））与 B 类"次级封锁机制"（连接池 `dead`、`halt_tail` 用已验证状态、库层约束兜底，**不读文件**）；MC66 按四部分拆分验证。改动点见 §0.10。
 
 **十四次修订（Final Consistency Cleanup）**：① 清除当前有效伪代码中的裸 `True/False`（七态表 1/2/5 行、`§6.9` 内存一致性）统一为 `WriteOutcome`；② `maintenance` 存储全文统一为 `<STATE_DIR>/maintenance.json`，六个写入通道共读同一契约，DB 不存维护态；③ 分派表启动自检改显式 `if` + `DispatchTableBroken`，普通模式与 `-O` 一致拒启动。改动点见 §0.10。
 
@@ -124,7 +126,7 @@
 | 十二次 P0-2 halt 故障安全 | §2.1 `halt_migration` 重写 + `guard_log` + 三道拒写机制表 + `fatal_exit` | 三动作独立保护、封锁须回读确认、未确认即致命非零退出、全程不写库不抛普通异常 |
 | 测试 | §2.5 MC61–MC62、§7 计数 60→62 | 真实 DB + 计数断言 |
 | 十三次 P0-1 语义统一 | §1.4 T6 三分支、§2.1 三态表/语义对照表/映射口径、§2.2 表、§2.3 表、MC43/49/59 | `A→SUCCESS`、`B→REJECTED`、`C→HALTED`、`L` 仅 tx_local；裸 `False` 清零 |
-| 十三次 P0-2 maintenance 一致性 | §2.1 halt 重写 + `verify_maintenance` + 持久化契约表；§2.2 `halt_tail` 显式检查 | 未确认不返回正常 HALTED；`fatal_exit` 非零退出；不用 `assert` |
+| 十三次 P0-2 maintenance 一致性 | §2.1 halt 重写 + 回读确认 + 持久化契约表（十六次拆名）；§2.2 `halt_tail` 显式检查 | 未确认不返回正常 HALTED；`fatal_exit` 非零退出；不用 `assert` |
 | 测试 | §2.5 MC63–MC64、MC62 收紧、§7 计数 62→64 | 读文件回读 + DB 零写 + 退出码断言 |
 | 十四次 裸 bool 清理 | §2.1 七态表 1/2/5 行、§6.9 内存一致性行 | `WriteOutcome.ABSENT/COMMITTED` 取代 True/False |
 | 十四次 maintenance 单一来源 | §3.3 A/B 职责表 + 唯一来源注（十五次重写） | 直接读取者读 `maintenance.json`；次级机制不读；DB 零维护态 |
@@ -132,6 +134,10 @@
 | 测试 | §2.5 MC65–MC67、§7 计数 64→67 | 类型断言 + 静态扫描 + 双模式运行 |
 | 十五次 §3.3 职责分离 | §3.3 重写为 A（五个直接读取者）/ B（次级封锁）两张表 + 职责边界注；§2.1 契约表新增"读取者职责"行 | 不再要求所有机制读文件；`halt_tail` 只用已验证状态 |
 | 十五次 MC66 拆分 | §2.5 MC66 四部分：唯一来源 / 次级封锁 / DB 唯一性 / 保守恢复 | 测试与职责定义一一对应 |
+| 十六次 三态判定入口 | §2.1 `MaintState` + `maintenance_state()` + `migration_incomplete()`，`verify_maintenance` 拆为 `confirm_maint_write`（写入确认）与 `maintenance_state`（状态判定） | 三态取代裸 bool；缺失不再等于正常 |
+| 十六次 判定矩阵 | §2.1 七行判定矩阵 + “判定 ≠ 写入确认”分离表 | 保守恢复在统一入口闭环 |
+| 十六次 §3.3 判据更新 | §3.3 A 表改为 `maintenance_state()` 三态 + `ACTIVE`/`RECOVERY_REQUIRED` 两列行为 | 五入口行为逐态对齐 |
+| 十六次 MC66(4) + MC68 | §2.5 MC66(4) 八步判定路径 + MC68 六输入矩阵与 halt 注入 | 路径可复现、可静态证明 |
 
 ### 0.3 四次修订改动点（S2 异常保护）
 
@@ -716,9 +722,9 @@ def halt_migration(rec, code, detail):
         faults.append(("set_maintenance", repr(e)))
         guard_log("halt_maintenance_failed", dict(err=e, code=code))
     try:
-        maint_ok = verify_maintenance(rec)         # 回读：文件存在 ∧ JSON 字段匹配 ∧ 内容一致
+        maint_ok = confirm_maint_write(rec)        # 写入确认：只问"我这一份是否落盘"，不推导维护态
     except Exception as e:
-        faults.append(("verify_maintenance", repr(e)))
+        faults.append(("confirm_maint_write", repr(e)))
         guard_log("halt_maintenance_unverified", dict(err=e, code=code))
     rec.maintenance_ok = maint_ok                  # 未确认即 False，绝不置 True 充数
 
@@ -760,8 +766,22 @@ def halt_migration(rec, code, detail):
     rec.halt_faults = faults
     return                                         # 正常返回的前提：maint_ok ∧ lock_ok
 
-def verify_maintenance(rec) -> bool:
-    """回读校验；任何不一致都返回 False，绝不"调用过就算成功"。"""
+class MaintState(Enum):
+    ACTIVE            = auto()   # 文件有效 ∧ 确认处于维护态
+    INACTIVE          = auto()   # 确认不处于维护态（依据：文件为 false 后的 DB 佐证，或缺失后的 DB 查询）
+    RECOVERY_REQUIRED = auto()   # 文件缺失/损坏/无法确认，或 DB 存在非 success 迁移行 → 保守恢复
+    # 禁止任何读取者再用裸 True/False 表达维护态
+
+PHASE_NAMES = {p.name for p in Phase}          # 用于"未知 phase ⇒ 不信任文件"的结构自洽检查
+
+class MaintUnverifiable(Exception):
+    """无法确认迁移是否未完成（库打不开/损坏/超时）。调用方必须转 RECOVERY_REQUIRED。"""
+
+def confirm_maint_write(rec) -> bool:
+    """写入确认（仅 halt_migration 使用）：只回答"我刚写的这一份是否真的落盘"。
+    规则与十三次定稿一字未改：文件存在 ∧ 可解析 ∧ maintenance is True
+    ∧ migration_id == rec.migration_id ∧ phase == rec.phase.name
+    ∧ since 非空 ∧ nonce == rec.maint_nonce。任何不一致都返回 False。"""
     try:
         blob = json.loads(Path(MAINT_FILE).read_text(encoding="utf-8"))
         return (blob.get("maintenance") is True
@@ -770,6 +790,47 @@ def verify_maintenance(rec) -> bool:
                 and blob.get("since") and blob.get("nonce") == rec.maint_nonce)
     except Exception:
         return False
+
+def read_maint_blob():
+    """只读解析维护文件；缺失/解析失败一律 None（不抛出、不猜默认值）。"""
+    try:
+        return json.loads(Path(MAINT_FILE).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+def migration_incomplete() -> bool:
+    """唯一允许的"读 DB 判断迁移是否未完成"实现（五个读取者不得各写一份）。
+    - 表不存在（迁移从未开始）⇒ False
+    - 存在任一 status != 'success' 行 ⇒ True
+    - 无法查询（打不开/损坏/超时）⇒ 抛 MaintUnverifiable（由调用方转保守恢复）"""
+    try:
+        with connect_readonly() as db:
+            if not table_exists(db, "schema_migrations"):
+                return False
+            return db.execute(
+                "SELECT 1 FROM schema_migrations WHERE status <> 'success' LIMIT 1"
+            ).fetchone() is not None
+    except MaintUnverifiable:
+        raise
+    except Exception as e:
+        raise MaintUnverifiable(repr(e))
+
+def maintenance_state() -> MaintState:
+    """唯一维护态判定入口：A 类五个直接读取者只准调这一个函数。
+    判定顺序：文件优先（权威）；文件给不出结论时才查 schema_migrations。"""
+    blob = read_maint_blob()
+    if blob is not None and blob.get("maintenance") is True:
+        # 维护态文件必须结构自洽，否则不信任（损坏文件不等于 ACTIVE）
+        if (blob.get("migration_id") and blob.get("since")
+                and blob.get("phase") in PHASE_NAMES):
+            return MaintState.ACTIVE
+        return MaintState.RECOVERY_REQUIRED
+    # maintenance:false 或文件缺失：不得直接当正常态，必须由 DB 佐证
+    try:
+        return (MaintState.RECOVERY_REQUIRED if migration_incomplete()
+                else MaintState.INACTIVE)
+    except MaintUnverifiable:
+        return MaintState.RECOVERY_REQUIRED      # 无法确认 ≠ 正常
 
 def commit_phase_in_memory(rec, new):
     """事件确认后的唯一 phase 落地动作。返回 PhaseResult，不再返回裸 bool。"""
@@ -824,12 +885,35 @@ def set_phase(rec, new, reason) -> PhaseResult:
 | 存放位置 | `MAINT_FILE = <STATE_DIR>/maintenance.json`；`STATE_DIR` 是部署目录下的状态目录，**与业务 SQLite 库分离**（同卷不同文件，不建表、不写 `system_events`、不进 `migration_tx_notes`） |
 | 内容 | `{"maintenance":true,"migration_id":MID,"phase":<当前phase>,"since":<UTC毫秒>,"nonce":<每次写入随机串>,"reason":<code>,"pid":<pid>}` |
 | 写入方式（原子） | 写 `maintenance.json.tmp.<nonce>` → `flush` + `os.fsync` → `os.replace` 到目标名（同目录 rename，POSIX 原子）→ `fsync(STATE_DIR)`。**不原地改写目标文件**，避免半写状态 |
-| 回读验证 | `verify_maintenance()`：重新读取目标文件 → JSON 解析成功 ∧ `maintenance is True` ∧ `migration_id == MID` ∧ `phase == rec.phase.name` ∧ `since` 非空 ∧ `nonce == rec.maint_nonce`。**只认回读结果，不认"调用过 `set_maintenance` 就算成功"** |
+| 写入确认（halt 专用） | `confirm_maint_write(rec)`：重新读取目标文件 → JSON 解析成功 ∧ `maintenance is True` ∧ `migration_id == MID` ∧ `phase == rec.phase.name` ∧ `since` 非空 ∧ `nonce == rec.maint_nonce`。**只认回读结果，不认“调用过 `set_maintenance` 就算成功”**；只回答“我这一份是否落盘”，**不**推导维护态 |
+| 状态判定（统一入口） | `maintenance_state() -> MaintState`：只回答“现在处于什么态”，返回 `ACTIVE` / `INACTIVE` / `RECOVERY_REQUIRED` 三态；**不要求 `nonce` 与当前进程匹配**（重启后 nonce 必然不同），但要求文件结构自洽（`migration_id`/`since` 非空 ∧ `phase ∈ PHASE_NAMES`）。判定矩阵见下表 |
 | 幂等 / 重复写 | 已存在且内容匹配则跳过写；不一致则重写；同一 `nonce` 保证可判定"这一份是否是我写的" |
 | 与写入禁令的关系 | maintenance 不经业务库，因此 halt 期间"禁止数据库写入"与"持久化 maintenance"不冲突；这也是唯一允许在 halt 中产生的持久化副作用 |
 | 失败语义 | `set_maintenance()` 抛错或回读不一致 ⇒ `maintenance_ok=False` ⇒ 继续执行写入封锁（不跳过），封锁确认后仍 `fatal_exit("maintenance_unconfirmed")`；**不得**在维护态未确认时返回正常 `HALTED` |
-| 重启后的判定 | 启动流程先读 `maintenance.json`：存在且 `migration_id` 匹配 ⇒ 进入维护态、业务写入 503；文件缺失但 `schema_migrations` 无 `success` ⇒ 仍按保守恢复处理，**不自动清维护态** |
-| 读取者职责 | **直接读取者**（应用写入、后台任务、CLI 写命令、`write_guard()`、重启恢复）统一用 `MAINT_FILE` + `verify_maintenance()`；**次级封锁机制**（连接池 `dead`/`PoolClosed`、库层约束与巡检）不读文件，由直接读取者的结果驱动；`halt_tail()` 只使用 `halt_migration` 已回读确认的 `maintenance_ok`/`writes_blocked`，**不重复读文件、也不使用未验证状态** |
+| 重启后的判定 | 启动流程只调 `maintenance_state()`：`ACTIVE` ⇒ 进入维护态、业务写入 503；`RECOVERY_REQUIRED` ⇒ 进入 `migration_recovery` 只读模式，**不清维护态、不自动推进 phase、不补写事件**；`INACTIVE` ⇒ 才允许正常启动（且该结论必须由 `migration_incomplete()` 的查询给出，**不得**由“文件不在”直接得出） |
+| 读取者职责 | **直接读取者**（应用写入、后台任务、CLI 写命令、`write_guard()`、重启恢复）统一用 `MAINT_FILE` + `maintenance_state()`（共享同一个 `migration_incomplete()`，不得各自查库）；**次级封锁机制**（连接池 `dead`/`PoolClosed`、库层约束与巡检）不读文件，由直接读取者的结果驱动；`halt_tail()` 只使用 `halt_migration` 已回读确认的 `maintenance_ok`/`writes_blocked`，**不重复读文件、也不使用未验证状态** |
+
+**维护态三态判定矩阵（`maintenance_state()`，唯一入口）**
+
+| 文件状态 | `schema_migrations` | 返回 | 对外行为 |
+| --- | --- | --- | --- |
+| 有效 ∧ `maintenance:true` ∧ 结构自洽 | **不查**（文件已是权威） | `ACTIVE` | 写 503；后台任务停；CLI 写拒绝；`write_guard()` 抛 `WriteRefused` |
+| 有效 ∧ `maintenance:false` | 全部 `success`，或表不存在 | `INACTIVE` | 正常放行（人工清标记亦须此佐证） |
+| 有效 ∧ `maintenance:false` | 存在任一 `status <> 'success'` | `RECOVERY_REQUIRED` | 写 503（`reason=recovery_required`），只读可用 |
+| 存在但解析失败 / 缺 `migration_id`·`since` / `phase` 不认识 | **不查**（损坏文件不可信） | `RECOVERY_REQUIRED` | 同上 |
+| **缺失** | 全部 `success`，或表不存在 | `INACTIVE`（依据是 DB 查询结果，**不是“文件不在”**） | 正常放行 |
+| **缺失** | 存在任一 `status <> 'success'` | `RECOVERY_REQUIRED` | 写 503 + `migration_recovery` 只读 |
+| 缺失 / 损坏 | 查询抛错（`MaintUnverifiable`） | `RECOVERY_REQUIRED`（无法确认 ≠ 正常） | 同上 |
+
+> 三条不得违反：① 文件缺失**永远不得**单独推出 `INACTIVE`；② `migration_incomplete()` 只实现一份，五个读取者共享其结果，**不得**各自写 SQL；③ `RECOVERY_REQUIRED` 只是“需保守恢复”的结论，**不是**“maintenance 已成功持久化”的证据。
+
+**判定与写入确认严格分离（本轮定稿）**
+
+| 问题 | 由谁回答 | 结论形态 | 能否替代另一方 |
+| --- | --- | --- | --- |
+| 现在是否处于维护态？ | `maintenance_state()` | 三态 | **不能**替代 `confirm_maint_write()`：它只描述“当下看到的状态” |
+| 我刚写的这一份是否落盘？ | `confirm_maint_write(rec)` | `True/False` | **不能**替代 `maintenance_state()`：它绑定本次 `mid`/`phase`/`nonce` |
+| DB 有非 success 迁移行能否免掉 halt 的写文件？ | —— | **绝对不能** | `halt_migration` 仍必须 `set_maintenance` + `confirm_maint_write()`；任一失败仍 `fatal_exit("maintenance_unconfirmed")`，**不得**因“重启后会保守恢复”降级为正常 `HALTED` |
 
 **halt 的三道拒写机制（不依赖单一内存标记）**
 
@@ -1051,7 +1135,7 @@ elif rec.phase == Phase.UNKNOWN:               # 路径 α 或 β′
 | 只读重查不可用（`SQLITE_BUSY`/文件不可读/连接失败） | **不允许解释为"事件不存在"** | 把查询失败当未提交会造成"库里已有事件、再走另一条转换" | 判 C：maintenance 保持、不重发、不开放写入 |
 | C 类结果被压缩成 `REJECTED` | **不允许** | C 意味着"库里可能有事件、也可能有断裂"，按普通失败继续写 note 会在不可信链上追加 | `WriteOutcome.UNRESOLVED` → `PhaseResult.HALTED`；note 的 C 类经 `note_or_stop` 直接 `halt_tail` |
 | C 类结果再次调用 `halt_migration` | **不允许** | `write_event` 已调用；重复调用会重复置位/重复日志，掩盖首次故障 | `halt_migration` 幂等 + `set_phase` 只做映射 |
-| maintenance 持久化失败仍返回正常 `HALTED` | **不允许** | 重启后无法识别维护态，业务写入可能恢复 | `verify_maintenance()` 回读确认；未确认 ⇒ `fatal_exit("maintenance_unconfirmed")`，非零退出 |
+| maintenance 持久化失败仍返回正常 `HALTED` | **不允许** | 重启后无法识别维护态，业务写入可能恢复 | `confirm_maint_write()` 回读确认；未确认 ⇒ `fatal_exit("maintenance_unconfirmed")`，非零退出 |
 | maintenance 与业务库同库存储 | **不允许** | halt 期间禁止数据库写入，同库存储会自相矛盾 | 独立 `STATE_DIR/maintenance.json`，原子 rename + fsync + 回读 |
 | 启动自检用 `assert` 承担安全校验 | **不允许** | `-O` 会裁剪 assert，坏分派表将静默通过 | 显式 `if` + `DispatchTableBroken` + `start_migration()` 拒绝启动（MC67） |
 | `halt_tail` 用 `assert` 承担前置检查 | **不允许** | 优化模式会裁剪 assert，安全检查失效 | 显式 `if not (maintenance_ok and writes_blocked)` → `fatal_lockdown` + `fatal_exit` |
@@ -1119,9 +1203,20 @@ elif rec.phase == Phase.UNKNOWN:               # 路径 α 或 β′
 | MC63 | `set_maintenance()` 抛错，但 `block_business_writes()` 与 `confirm_writes_blocked()` 成功 | 走完整 halt → `halt_tail` 链路；读文件、DB、退出码 | 封锁动作仍被执行且回读确认；`maintenance_ok=False`；**不返回正常 `HALTED`**（`fatal_exit("maintenance_unconfirmed")`，退出码非零）；`halt_tail` 前置检查不因 `assert` 产生未处理异常（改为显式检查 + 致命路径）；`maintenance.json` 不存在或内容不匹配时**不误报为 true**；无 `migration_note`、无第二次 `INSERT`、无 success；业务写入 503（由封锁保证） |
 | MC64 | ① 持久化成功但回读失败（改 `nonce` / 改 `phase` / 截断文件） ② 持久化失败（`os.replace` 抛错 / 目录只读）且回读失败 | 分别验证 | 两种都 `maintenance_ok=False`、不误报成功、不返回虚假 `HALTED`；封锁确认后 `fatal_exit("maintenance_unconfirmed")`；封锁无法确认则 `fatal_lockdown` + `fatal_exit("writes_block_unconfirmed")`；`guard_log` 降级链有效（文件失败 → stderr 有输出）；halt 之后数据库写入次数 == 0（连接级计数） |
 | MC65 | 遍历当前有效接口：`write_event`、`emit_event`、`append_reason` 的返回类型；`set_phase` 的返回类型；A/B/C/L 四类结果的映射 | 类型断言 + 映射表比对 + 真实 DB | 前三者返回 `WriteOutcome`（非 `bool`、非 `None`）；`set_phase` 返回 `PhaseResult`；A→`COMMITTED`→`SUCCESS`、B→`ABSENT`→`REJECTED`、C→`UNRESOLVED`→`HALTED`、L 仅 tx_local；全文当前有效伪代码中无 `return True/False`（静态扫描 `write_event`/`emit_event`/`append_reason`/`set_phase` 函数体）；`REJECTED` 出现处不含 C 路径 |
-| MC66 | 分四部分验证：(1) 唯一来源：应用写入、后台任务、CLI、`write_guard()`、重启恢复五个直接读取者；(2) 次级封锁：连接池、`halt_tail`、库层约束/巡检；(3) DB 唯一性；(4) 保守恢复 | 静态扫描 + 运行断言 + DB 检索 + 删文件实验 | (1) 五处都引用同一 `MAINT_FILE` 常量与同一 `verify_maintenance()`，无第二套判据（无 `exists()` 单独判定、无读 DB 判定）；(2) 连接池维护期为 `dead`、`checkout` 抛 `PoolClosed`；`halt_tail` 在 `maintenance_ok`/`writes_blocked` 任一为假时**不返回**（`fatal_exit`）；库层约束与巡检仍生效（`foreign_key_check` 可发现违规）；(3) 17 张基准表 + 设计新增表中检索 `maintenance`/`maint` 表列 **0 命中**；`schema_migrations` 仅 `success` 行，无维护态字段；(4) 删除 `maintenance.json` 而 DB 存非 `success` 迁移行 ⇒ 五个直接读取者一律保守恢复、写入不开放 |
+| MC66 | 分四部分验证：(1) 唯一来源：五个直接读取者共用同一入口；(2) 次级封锁：连接池、`halt_tail`、库层约束/巡检；(3) DB 唯一性；(4) **文件缺失时的保守恢复判定路径** | 静态扫描 + 运行断言 + DB 检索 + 删文件实验 + 断库实验 | (1) 五处都只调 `maintenance_state()`，其内部只调一份 `migration_incomplete()`；无第二套判据（无 `exists()` 单独判定、无各处自写 SQL）；(2) 连接池维护期为 `dead`、`checkout` 抛 `PoolClosed`；`halt_tail` 在 `maintenance_ok`/`writes_blocked` 任一为假时**不返回**（`fatal_exit`）；库层约束与巡检仍生效（`foreign_key_check` 可发现违规）；(3) 17 张基准表 + 设计新增表中检索 `maintenance`/`maint` 表列 **0 命中**；`schema_migrations` 仅 `success` 行，无维护态字段；(4) 判定路径逐条见下方“MC66(4) 实际判定路径” |
+| MC68 | 三态判定矩阵 + “判定 ≠ 写入确认”分离：(a) 文件有效 `maintenance:true` 结构自洽；(b) 文件缺失 + DB 全 `success`；(c) 文件缺失 + DB 有 `status<>'success'`；(d) 文件 `maintenance:false` + DB 有非 `success`；(e) 文件损坏（截断/未知 `phase`/缺 `since`）；(f) 文件缺失 + DB 查询抛错；另在 halt 内注入 `set_maintenance()` 抛错而 DB 有非 `success` 行 | 运行断言 + 五种输入矩阵 + 注入 | (a) `ACTIVE`；(b) `INACTIVE`（并静态证明该结论来自 `migration_incomplete()` 的返回值，删除该次查询即无法得到 `INACTIVE`）；(c)(d) `RECOVERY_REQUIRED`，五入口一致、写入 503/`WriteRefused`/CLI 拒绝且 `--allow-write` 无效；(e) `RECOVERY_REQUIRED`（不因 `maintenance:true` 就判 `ACTIVE`）；(f) `RECOVERY_REQUIRED`（“无法确认 ≠ 正常”）；全流程 `maintenance_state()` 返回类型为 `MaintState`，无裸 `True/False`；halt 注入场景仍 `fatal_exit("maintenance_unconfirmed")` 且 `rec.maintenance_ok=False`（`RECOVERY_REQUIRED` **不得**被当作持久化成功）；零数据库写入 |
 | MC67 | 注入四种坏分派表：① 键集合与 `LEGAL_TRANSITIONS` 不一致 ② T1 或 T2 标成 `durable` ③ T6/T7/T8 任一标成 `tx_local` ④ 出现未知后端值 `"xxx"`；分别在**普通模式**与 `python -O` 下运行启动自检 | 观察 `start_migration()` 返回值 | 四种 × 两模式**全部拒绝启动**（`DispatchTableBroken` 抛出并落 `dispatch_table_broken` 文件日志、`exit_code=EXIT_CONFIG`、`start_migration()` 返回 False）；两模式结果**逐项一致**（不因 `-O` 而放行）；正常分派表在两模式下均通过 |
 
+**MC66(4) 实际判定路径（本轮定稿，逐跳可复现）**
+
+1. 删除 `<STATE_DIR>/maintenance.json`，业务库保留一条 `schema_migrations.status='running'`（模拟升级中断）。
+2. 任一直接读取者进入 → 只调 `maintenance_state()`（无分支旁路）。
+3. 函数内 `read_maint_blob()` 返回 `None`（缺失）。
+4. 不走"缺失即正常"的短路，转入 `migration_incomplete()`：以只读连接打开业务库 → `table_exists(schema_migrations)` 为真 → 执行 `SELECT 1 ... WHERE status <> 'success' LIMIT 1` 命中一行 ⇒ `True`。
+5. `maintenance_state()` 返回 `RECOVERY_REQUIRED`。
+6. 读取者据此拒绝写入：HTTP 503（`reason=recovery_required`）、CLI 写命令退出非零、`write_guard()` 抛 `WriteRefused("recovery_required")`、后台任务本轮不启动、重启恢复进入 `migration_recovery` 只读（60 分钟内不自动推进 phase、不补写 `system_events`）。
+7. 反向夹具：同一库把 `schema_migrations` 全部置为 `success` 后仍删文件 ⇒ 同一路径在第 4 步命中 0 行 ⇒ 返回 `INACTIVE`（`INACTIVE` 由这次查询给出，删除该查询后代码无法产出 `INACTIVE`，静态可证）。
+8. 断库夹具：把库文件置为不可读 ⇒ `migration_incomplete()` 抛 `MaintUnverifiable` ⇒ 第 5 步返回 `RECOVERY_REQUIRED`，不得降级为 `INACTIVE`。
 
 ---
 
@@ -1265,15 +1360,17 @@ k1 = quarantined_ok and close_ok and conn_wrapper.is_closed and conn_wrapper.no_
 
 **A. 维护态直接读取者（唯一来源 `<STATE_DIR>/maintenance.json`）**
 
-| 读取者 | 读取时点 | 判据 | 维护期间的对外行为 |
-| --- | --- | --- | --- |
-| 应用写入入口 | 每个写请求进入业务逻辑前 | `MAINT_FILE` 常量 + `verify_maintenance()`（`maintenance is True ∧ migration_id` 匹配 ∧ `phase`/`since`/`nonce` 一致） | 503，且在响应体标明维护中 |
-| 后台任务 | 每轮任务开始前 | 同上，同一个 `verify_maintenance()` | 本轮不运行；状态机标 `stopped` |
-| CLI 写命令 | 执行前 | 同上 | 拒绝执行；`--allow-write` **不得**绕过维护态封锁 |
-| `write_guard()` | 任何走正式入口的写之前 | 同上 + 规定的两项 PRAGMA 检查 | 抛 `WriteRefused` |
-| 重启恢复 | 启动第一步 | 同上 | 进入维护态、503；文件缺失但 DB 有非 `success` 迁移行 ⇒ 保守恢复 |
+| 读取者 | 判定时点 | 判据（同一入口） | `ACTIVE` | `RECOVERY_REQUIRED` |
+| --- | --- | --- | --- | --- |
+| 应用写入入口 | 每个写请求进入业务逻辑前 | `maintenance_state()` | 503（`reason=maintenance`） | 503（`reason=recovery_required`） |
+| 后台任务 | 每轮任务开始前 | 同上 | 本轮不运行；状态机标 `stopped` | 不运行；且不得自行重试升级 |
+| CLI 写命令 | 执行前 | 同上 | 拒绝执行；`--allow-write` **不得**绕过 | 同样拒绝；`--allow-write` 亦不绕过 |
+| `write_guard()` | 任何走正式入口的写之前 | 同上 + 规定的两项 PRAGMA 检查 | 抛 `WriteRefused("maintenance")` | 抛 `WriteRefused("recovery_required")` |
+| 重启恢复 | 启动第一步 | 同上 | 进入维护态、业务写入 503 | 进入 `migration_recovery` 只读：不清维护态、不推进 phase、不补写事件 |
 
-> 五个读取者必须共用同一 `MAINT_FILE` 路径常量与同一 `verify_maintenance()`；**不得**任何一处自行实现"文件存在即维护中"或"读 DB 再判断"的变体。
+> 五个读取者必须共用同一 `MAINT_FILE` 路径常量与同一 `maintenance_state()`；`INACTIVE` 的唯一合法来源是入口内部那次 `migration_incomplete()` 查询（**不得**任何一处自行实现"文件存在即维护中"、"文件不在即正常"或"读 DB 再判断"的变体）。
+>
+> `RECOVERY_REQUIRED` 属于"需保守恢复"的结论，**不做**任何写入放行判定；它与 `halt_migration` 的 `confirm_maint_write()` 互不替代（后者只确认本次 halt 写出的那份文件是否落盘）。
 
 **B. 次级封锁机制（不读维护文件）**
 
@@ -1285,7 +1382,7 @@ k1 = quarantined_ok and close_ok and conn_wrapper.is_closed and conn_wrapper.no_
 
 > **职责边界**：A 类回答"现在是否处于维护态"；B 类回答"即使判定出错，写还能不能落到库里"。B 类不得被要求承担 A 类的判定职责，A 类也不得以"已经 503 了"替代 B 类的硬封锁。
 
-> **维护态不在数据库**：业务 SQLite 中**不存**任何 maintenance 状态——不建表、不写 `settings`、不写临时标记；`schema_migrations` 只保留最终 `success`，不承担维护态存储职责。文件缺失而 DB 存在非 `success` 迁移行时，A 类读取者一律按保守恢复处理，**不自动放行写入**。
+> **维护态不在数据库**：业务 SQLite 中**不存**任何 maintenance 状态——不建表、不写 `settings`、不写临时标记；`schema_migrations` 只保留最终 `success`，不承担维护态存储职责。文件缺失或损坏时，A 类读取者必须经 `maintenance_state()` 内的 `migration_incomplete()` 查询才可能得出 `INACTIVE`；存在非 `success` 迁移行或查询失败 ⇒ `RECOVERY_REQUIRED`，**不自动放行写入**。
 
 **关键补充（本轮）**：S5 是瞬时探测，"探测后又被别人拿到写锁"是必须处理的情形。
 
@@ -1494,7 +1591,7 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | --- | --- |
 | K1 四条件 | §3.1（隔离、close 成功、句柄不可用、关闭后不读事务属性） |
 | S5 独立定义 | §3.2 表（瞬时探测、不得替代 K1、必须关探测连接） |
-| S5 后持续封锁 | §3.3 六通道表 + S5′ 复探 |
+| S5 后持续封锁 | §3.3 两类机制职责表（A 直接读取者 / B 次级封锁）+ S5′ 复探 |
 | close 失败/探测失败/被抢写锁 | §3.3 五种情形表（close 失败停 `COMMIT_ATTEMPTED`，不判 UNKNOWN） |
 | 关闭接口统一 | §3.1 对象关系表：迁移流程只调 `conn_wrapper.close()`；底层成功才置 `is_closed` |
 | **隔离期禁写数据库** | §3.1 禁令表：S2–S5 未完成前只允许 `migration-fault.log`；ROLLBACK 失败分支也走非 DB 日志 |
@@ -1575,7 +1672,7 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | C 类不降级（十二次） | `WriteOutcome`（COMMITTED/ABSENT/UNRESOLVED/LOCAL）取代裸 bool；`set_phase` 对 `UNRESOLVED` 只映射为 `HALTED`，不重复 halt；`note_or_stop` 处理 note 的 C 类 | §2.1 / §2.2 | MC61 |
 | halt 故障安全（十二次） | 三个保护动作独立 `try` + `guard_log` 三层降级 + `confirm_writes_blocked` + `fatal_lockdown`/`fatal_exit` | §2.1 halt 伪代码 + 三道拒写机制表 | MC62 |
 | A/B/C 语义统一（十三次） | 全篇统一映射；清除 §1.4「False」、§2.1 语义对照中的 False、MC43 的 False 断言 | §1.4 / §2.1 / §2.2 / §2.3 / §2.5 / §8 | MC43/MC49/MC61 |
-| maintenance 一致性（十三次） | `maintenance.json` 原子写 + `verify_maintenance` 回读；未确认即 `fatal_exit`；`halt_tail` 显式检查 | §2.1 持久化契约表 | MC63/MC64 |
+| maintenance 一致性（十三次） | `maintenance.json` 原子写 + 回读确认（十六次起函数名为 `confirm_maint_write()`）；未确认即 `fatal_exit`；`halt_tail` 显式检查 | §2.1 持久化契约表 | MC63/MC64 |
 | 无裸 bool 残留（十四次） | 七态表 1/2/5 行改为 `WriteOutcome.ABSENT`/`COMMITTED`；§6.9 内存一致性改判 `COMMITTED` | §2.1 / §6.9 | MC65 |
 | maintenance 单一来源（十四次） | §3.3 A 类直接读取者共用同一 `maintenance.json`（十五次起按 A/B 职责拆分，B 类不读文件）；DB 不存维护态 | §3.3 / §2.1 契约 | MC66 |
 | 启动自检不用 assert（十四次） | `check_dispatch_invariants()` 显式 if + `DispatchTableBroken` + `start_migration()` | §2.1 | MC67 |
@@ -1594,7 +1691,7 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | RC | 6 | 6 | — |
 | CF | 8 | 8 | — |
 | AU | 9 | 9 | — |
-| MC | 12 | **67** | +MC13–MC18；二次修订 +MC19–MC20；三次修订 +MC21、MC15b/15c/15d、MC13b；四次修订 +MC22–MC24；五次修订 +MC25/MC26/MC26b/MC27/MC27b；六次修订 +MC34–MC37；七次修订 +MC38–MC43；八次修订 +MC44–MC47；九次修订 +MC48–MC56；十次修订 +MC57–MC59；十一次修订 +MC60（含对照 MC60b）；十二次修订 +MC61–MC62；十三次修订 +MC63–MC64（MC62 语义收紧）；十四次修订 +MC65–MC67；十五次修订仅修订 MC66 职责拆分（数量不变） |
+| MC | 12 | **68** | +MC13–MC18；二次修订 +MC19–MC20；三次修订 +MC21、MC15b/15c/15d、MC13b；四次修订 +MC22–MC24；五次修订 +MC25/MC26/MC26b/MC27/MC27b；六次修订 +MC34–MC37；七次修订 +MC38–MC43；八次修订 +MC44–MC47；九次修订 +MC48–MC56；十次修订 +MC57–MC59；十一次修订 +MC60（含对照 MC60b）；十二次修订 +MC61–MC62；十三次修订 +MC63–MC64（MC62 语义收紧）；十四次修订 +MC65–MC67；十五次修订仅修订 MC66 职责拆分（数量不变）；十六次修订 +MC68（MC66(4) 判定路径细化） |
 | CR | 5 | 5 | — |
 | FX | 3 | **4** | +FX4 |
 | PH | 5 | **13** | +PH6–PH11、PH9b、PH10b |
@@ -1677,13 +1774,16 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | 封锁未确认即致命 | `confirm_writes_blocked` + `fatal_exit` | §2.1 三道机制表 | MC62 |
 | 语义映射全篇唯一 | `A→SUCCESS`/`B→REJECTED`/`C→HALTED`/`L` 仅 tx_local | §1.4 / §2.1 / §2.2 / §2.3 | MC43/MC49/MC61 |
 | 无裸 `False` 断言残留 | 全文检索 `返回 False` 已清零（仅存于历史说明） | §2.5 / §8 | MC43 |
-| maintenance 持久化可回读 | `maintenance.json` 原子 rename + `verify_maintenance` | §2.1 契约表 | MC63/MC64 |
+| maintenance 持久化可回读 | `maintenance.json` 原子 rename + `confirm_maint_write()` | §2.1 契约表 | MC63/MC64 |
 | `halt_tail` 不依赖 assert | 显式检查 + `fatal_exit` | §2.2 | MC63 |
 | 当前有效伪代码无裸 bool | 七态表/内存一致性/自检全部改为枚举 | §2.1 / §6.9 | MC65 |
-| maintenance 唯一来源（文件） | §3.3 A 类五个直接读取者共用 `MAINT_FILE` + `verify_maintenance()` | §3.3 / §2.1 | MC66(1) |
+| maintenance 唯一来源（文件） | §3.3 A 类五个直接读取者共用 `MAINT_FILE` + `maintenance_state()` | §3.3 / §2.1 | MC66(1) |
 | 次级机制不读文件 | §3.3 B 类：连接池 `dead`、`halt_tail` 用已验证状态、库层约束兜底 | §3.3 / §2.2 | MC66(2) |
 | DB 零维护态 | 无 maintenance 表/列/临时标记；`schema_migrations` 仅 `success` | §3.3 / §2.1 | MC66(3) |
-| 保守恢复 | 删文件 + 非 success 迁移行 ⇒ 不自动放行 | §3.3 / §2.1 | MC66(4) |
+| 三态判定入口 | `maintenance_state()` 返回 `ACTIVE`/`INACTIVE`/`RECOVERY_REQUIRED`；无裸 bool | §2.1 伪代码 + 判定矩阵 | MC68 |
+| 缺失不即正常 | 文件缺失一律经 `migration_incomplete()` 才可能得 `INACTIVE`；查询失败 ⇒ `RECOVERY_REQUIRED` | §2.1 矩阵 / §3.3 A 表 | MC66(4) / MC68(b)(f) |
+| 判定 ≠ 写入确认 | `confirm_maint_write()` 只答“我这份是否落盘”；`RECOVERY_REQUIRED` 不得替代它 | §2.1 分离表 | MC68 halt 注入 |
+| 保守恢复 | 删文件 + 非 success 迁移行 ⇒ 五入口同为 `RECOVERY_REQUIRED`、不自动放行 | §2.5 MC66(4) 判定路径 | MC66(4) |
 | 自检 `-O` 与普通模式一致 | 显式 `if` + `DispatchTableBroken` | §2.1 | MC67 |
 | 独立夹具 | §4.2 | — | FX4/R10-A0/A1/A2 |
 
@@ -1765,10 +1865,11 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | 38 | `set_maintenance` 失败但封锁成功 → `halt_tail` 断言崩溃 | maintenance 未确认即 `fatal_exit`；`halt_tail` 显式检查 | MC63/MC64 |
 | 39 | maintenance 与业务库同库 → halt 期间无法持久化 | 独立 `STATE_DIR/maintenance.json` 原子写 + 回读 | MC64 |
 | 40 | 七态表/内存一致性仍用裸 bool → 实施按旧语义 | 统一 `WriteOutcome`/`PhaseResult`，全文当前有效章节清零 | MC65 |
-| 41 | 部分入口仍读 DB 里的 maintenance → 与文件状态分裂 | §3.3 A 类五个直接读取者统一文件契约 + DB 零维护态 | MC66(1)(3) |
+| 41 | 部分入口仍读 DB 里的 maintenance → 与文件状态分裂 | §3.3 A 类五个直接读取者统一 `maintenance_state()` + DB 零维护态 | MC66(1)(3) |
+| 41c | 文件缺失被当成正常态，升级中断后自动开放写入 | 缺失必须经 `migration_incomplete()`；非 `success` 或查询失败 ⇒ `RECOVERY_REQUIRED` | MC66(4) / MC68 |
 | 41b | 为"统一来源"强迫次级机制也读文件 → 职责错位、多套判据 | A/B 两类职责分离；B 类由 A 的结果驱动 | MC66(2) |
 | 42 | 启动自检被 `-O` 裁剪 → 坏分派表静默通过 | 显式 `if` + 专用异常 + 拒绝启动 | MC67 |
 
 ---
 
-**v1.10 到此结束。** 十五次修订合计**未编写代码、未执行迁移、未修改数据库、未修改生产配置或生产数据**；十五次修订累计只处理"五项 + 两项 + 三项 + S2 异常保护 + 路径与关闭接口一致性 + β′ 跨重启证据 + 证据写入路径 + 证据完整性 + 提交结果确认 + 转换级分派与 phase 落地窗口 + halt 上行传递 + C 类不降级与 halt 故障安全 + 语义统一与 maintenance 持久化一致性 + 裸 bool 清理、维护态单一来源与自检去 assert + 维护态读取者职责分离"的状态机与伪代码矛盾。**C11–C20 全部未确认，C12 仍未被本轮视为已批准。** 文档交回总体设计最终审查；未获批准前不提交 P-1 实施计划、不进入任何实施阶段。
+**v1.10 到此结束。** 十六次修订合计**未编写代码、未执行迁移、未修改数据库、未修改生产配置或生产数据**；十六次修订累计只处理"五项 + 两项 + 三项 + S2 异常保护 + 路径与关闭接口一致性 + β′ 跨重启证据 + 证据写入路径 + 证据完整性 + 提交结果确认 + 转换级分派与 phase 落地窗口 + halt 上行传递 + C 类不降级与 halt 故障安全 + 语义统一与 maintenance 持久化一致性 + 裸 bool 清理、维护态单一来源与自检去 assert + 维护态读取者职责分离 + 维护态三态判定在统一入口闭环、判定与写入确认分离"的状态机与伪代码矛盾。**C11–C20 全部未确认，C12 仍未被本轮视为已批准。** 文档交回总体设计最终审查；未获批准前不提交 P-1 实施计划、不进入任何实施阶段。
