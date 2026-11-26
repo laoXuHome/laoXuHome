@@ -278,38 +278,30 @@ docker exec nodepool sh -c 'stat -f -c "state_fs=%T block=%s" /data; stat -f -c 
 
 前提：v1.10 的设计已被批准，本轮只把它落成**可执行的工程步骤**，不重新设计。以下每项给"目的 / 做法 / 触碰面 / 判据 / 回滚"。
 
-### 2.1 SQLite 安全备份方案
+### 2.1 手动备份导出方案（v1.10 修订：单文件）
 
-**目的**：在 WAL 模式下得到**一致**快照，并且保证"拿到的备份一定配得上一份完整的清单"。
+**目的**：用户手动执行一条命令，得到一个**独立、可校验、可交付**的数据库备份文件；允许在服务运行期执行。
 
 **做法**：
 
-1. 一律用 SQLite 在线备份 API：`src.backup(dst, pages=1024)`，**禁止** `cp`/`shutil.copy2` 主库（§2.4 有实测反例：WAL 下 `copyfile` 得到"连表都没有"的库）。
-2. 备份源用**独立只读连接**（`mode=ro`），不复用业务线程本地连接；分页备份，批间让出调度权。
-3. **备份以"备份集目录"交付**，而不是单个 `.db` 文件：
+1. 一律用 SQLite 在线备份 API（`src.backup(dst, pages=1024)`）。**禁止** `cp`/`shutil.copy2` 正在使用的库：WAL 下文件拷贝会得到缺表丢行的副本（§2.4 有实测反例）。
+2. 备份源用**独立只读连接**（`mode=ro`），不复用业务线程连接。
+3. **产物是单文件 + 同名元信息**，不再是"备份集目录"，也不再有三件套：
 
 ```
-BACKUP_DIR/nodepool-YYYYMMDD-HHMMSS-<stage>/
-    db                 # SQLite 一致性快照
-    manifest.json      # 逐表行数、关键表摘要、schema 版本、sqlite_version、created_at
-    complete.json      # {db_sha256, manifest_sha256, bytes, finished_at, stage}
+BACKUP_DIR/nodepool-YYYYMMDD-HHMMSS-<label>.db    # 一致性快照（独立文件，可单独拷走）
+BACKUP_DIR/nodepool-YYYYMMDD-HHMMSS-<label>.json  # 元信息：created_at/app_version/sqlite_version/
+                                                 # db_bytes/sha256/integrity_check/structure_hash/
+                                                 # structure_profile/schema_version/tasks/tables/key_digests
 ```
 
-4. 发布顺序（必须严格按此，否则会出现"有 db 没清单"的假备份）：
-   ① 在 `BACKUP_DIR/.tmp-<nonce>/` 内写 `db`、写 `manifest.json`、写 `complete.json`；
-   ② 三个文件逐个 `flush + fsync`；
-   ③ 计算 `db`/`manifest` 的 sha256 并写进 `complete.json`，再 `fsync` `complete.json`；
-   ④ 对 `.tmp-<nonce>/` 目录 `fsync`；
-   ⑤ `os.replace(".tmp-<nonce>", "nodepool-<stamp>-<stage>")`（同卷目录 rename，原子）；
-   ⑥ `fsync(BACKUP_DIR)`。
-5. **有效备份的唯一判据**：目录内 `db`、`manifest.json`、`complete.json` **三件齐全**，且 `complete.json` 里的两个 sha256 与实文件相符。缺任一件 ⇒ 视为**未完成/无效**：不计入可用备份、不参与恢复候选、不被清理策略删除（保留 24 小时后由人工处置）。
-6. `nodepool-latest.db` 的兼容副本改为"指向最近一个完整备份集的软链接/复制件"，只有该备份集三件齐全时才更新；缺失时保持上一份不动。
+4. 发布顺序：`.tmp-<nonce>.db` 写入 → `fsync` → **独立只读连接**上 `integrity_check` + 表集合 + 结构摘要 → 全部通过才 `os.replace` 落名 → 目录 `fsync` → 写元信息（含 sha256）→ 目录 `fsync`。校验不过即删除临时文件，**不产生半成品文件**。
+5. **不做滚动清理**：备份由用户保管，程序不自动删除、不生成 `nodepool-latest.db` 指针、不设 `pre-migrate`/`pre-restore` 保护标记。
+6. CLI：`python -m backend.database.cli backup [--out DIR] [--label manual]`；`/api/system/backup` 与 `/download` 复用同一函数（`ok/file/size/sha256/integrity_check`）。
 
-**触碰面**：新增 `backend/database/backup.py`；`routes.py` 的 `/system/backup`、`/system/backup/download` 改调它（响应字段仍是 `ok/file/size`，`file` 传目录名）。
+**判据**：PBT-01（导出单文件+元信息）、PBT-02（运行期导出一致性）、PBT-03（完整性校验）通过；100 MB 库导出 ≤5s。
 
-**判据**：PT-01/PT-02/PT-03/PT-03b 通过；`ok/file/size` 字段不破坏现有前端调用（前端只展示文件名与体积）。
-
-**回滚**：删 `backup.py` + `NODEPOOL_BACKUP_IMPL=legacy` 回旧实现；已生成的备份集目录可直接删除（不影响业务）。
+**回滚**：删除 `backup.py` 的导出路径即可；产物是独立文件，不涉及库内状态。
 
 ### 2.2 Schema 版本管理方案
 
@@ -369,45 +361,36 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 **回滚**：`DROP TABLE schema_migrations`（仅此表由 P-1 创建）。
 
-### 2.3 迁移前自动快照方案
+### 2.3 迁移与备份解耦（原"迁移前自动快照"已删除）
 
-**目的**：任何 `ALTER`/重建之前先有"已验证可恢复"的快照；快照不可用即禁止继续。
+**目的**：明确"手动备份"和"结构迁移"是两件独立的事，迁移器不再替用户做备份决策。
 
 **做法**：
 
-1. 触发点：迁移器在写 `status='running'` **之前**调用 `snapshot(stage='pre-migrate')`。
-2. 顺序固定为：置维护态 → 确认写入封锁（`confirm_writes_blocked`）→ `wal_checkpoint(TRUNCATE)` 且返回 `(0,0,0)` → 两次探测间隔 ≥10s → 备份 → L1+L2 → 才允许写 `running`。
-3. 快照产物 = §2.1 的**完整备份集**（`db` + `manifest.json` + `complete.json`）；`manifest.json` 由**同一份备份文件**读出生成（不读实时源库），见 §2.4。
-4. **同一快照一致性锚**：备份前后各取一次源库 `PRAGMA data_version`（只读连接）。两次相等 ⇒ 源库在备份期间无其他连接提交写 ⇒ 允许把 `manifest` 的行数与"停写后读到的源库计数"做等值比较（这是 L2 的唯一合法比较场景）。两次不等 ⇒ 只做备份内部自洽校验，禁止与源库比较。
-5. 保留策略：`pre-migrate`/`pre-restore` 永不自动删除；`daily` 保留最近 3 份；其余按总量上限（默认库大小 ×10）滚动删除，删除前必须 `complete.json` 校验通过（防止把半成品当垃圾清掉）。
+1. `migrate.run()` **不再**接收 `snapshot`/`snapshot_stage` 参数，也不再在任何阶段调用备份函数；`running` 之前不再强制快照。
+2. 升级前的备份由运维**手动**执行 `cli backup`（建议导到 NAS 之外或独立目录）；是否备份、备份放哪、保留多久，都由用户决定。
+3. 迁移失败**不**自动恢复生产库、**不**自动寻找备份、**不**自动回退 `pre-restore`；失败只做三件事：写 `schema_migrations.status='failed'`、保持维护态与写封锁、写 `migration-fault.log`。
+4. 解除失败态的唯一路径是运维**手动导入**（§2.5.2），导入命令本身才是"恢复"，且必须先停写、关连接、过校验。
 
-**触碰面**：`backup.py`、`migrate.py`；CLI `python -m backend.database.migrate snapshot --stage pre-migrate`。
+**触碰面**：`migrate.py`（删 `snapshot` 分支）、`backup.py`（不再提供 `snapshot_set`）。
 
-**判据**：PT-07 通过（备份失败 ⇒ `halt_migration("snapshot_failed")`、不写 `running`、退出码非零、写入仍被拒）；快照 ≤60s（100 MB 库实测回填）。
+**判据**：PBT-09 通过（迁移 dry-run 期间备份目录零新增文件）。
 
-**回滚**：删本次备份集目录即可。
+**回滚**：恢复 `snapshot` 参数即可（本项不涉数据）。
 
-### 2.4 备份完整性验证与恢复验证方案
+### 2.4 备份完整性验证方案（单文件）
 
-**目的**：杜绝"备份存在但打不开/数据不全"的假安全，也杜绝"用实时库计数比备份造成误报或放宽"。
+**目的**：杜绝"文件存在但打不开/缺表/结构不认识"的假安全；校验对象永远是**同一份文件**。
 
-**做法**（三级，逐级独立）：
+**做法**（两级 + 一次人工演练）：
 
-1. **L1 结构验证**：`mode=ro` 打开 `db` → `PRAGMA integrity_check` 必须 `ok` → `PRAGMA foreign_key_check` 0 行 → 17 张基准表齐全（`tasks` 若在则登记存在与否）→ `complete.json` 的两个 sha256 与实文件一致。
-2. **L2 内容验证（严格限定比较对象）**：
+1. **L1 结构验证**（`mode=ro`）：文件存在且非空 → `PRAGMA integrity_check == ok` → 17 张基准表齐全 → 结构摘要命中已登记 profile（`structure_profile_unregistered` ⇒ fail-closed）→ 若同名 `.json` 存在，则 `db_bytes` 与 `sha256` 必须与实文件相符。
+2. **L2 内容验证**：逐表 `count(*)` 与元信息 `tables` 比对（元信息由**同一份备份文件**读出生成），不一致即失败。**禁止**拿备份与"备份完成后的实时源库"比较：在线导出期间源库仍在变，这种比较只会产生随机误报或掩盖真实丢失。
+3. **L3 人工演练**：把备份文件复制到独立路径（`/tmp/restore-check/nodepool.db`），独立端口 8089 起临时实例（`NODEPOOL_MIGRATION_ENABLED=0`、独立 `STATE_DIR`），验证 `/healthz` 200、机场/节点/设置条数与元信息一致、订阅四格式可重建；完成后删副本。每次升级窗口前至少做一次。
 
-| 场景 | 允许的比较 | 禁止 |
-| --- | --- | --- |
-| 停写后快照（`data_version` 前后相同） | 备份逐表 `count(*)` **与停写后读到的源库计数**逐表等值；关键表（`airports`/`nodes`/`settings`/`test_groups`）用规范化摘要比对 | —— |
-| 在线备份（`data_version` 变化或未测） | 只做**备份内部自洽**：`manifest` 的计数必须由**同一份备份文件**读出并与之相符；`complete.json` 的 sha256 相符 | **禁止**拿备份与"备份完成后的实时源库"比较；也不得用实时计数"放宽"允许差异 |
+**触碰面**：`backup.py` 的 `verify_backup()`、CLI `verify [--file]`。
 
-   > 记一条硬规则：**L2 的参照物只能是同一快照**。实时源库在备份完成后仍在变，任何"实时计数 vs 备份计数"的比较都会产生随机差异，既可能误报也可能掩盖真实丢失。
-3. **L3 恢复演练**：把备份集恢复到**独立路径**（`/tmp/restore-check/nodepool.db`），用**独立端口 8089** 起临时实例（`NODEPOOL_MIGRATION_ENABLED=0`），验证 `/healthz` 200、登录、机场/节点/设置条数与 `manifest` 一致、订阅四格式可重建；完成后停容器、删副本。
-4. 门槛：`pre-migrate` 必须过 L1+L2；L3 在每次升级窗口前至少做一次。
-
-**触碰面**：`backup.py` 的 `verify_set()`（L1+L2）、CLI `migrate verify --set <dir>`。
-
-**判据**：PT-03/PT-04/PT-04b/PT-05 通过；构造"实时库比备份多 3 行"的场景，在线备份模式必须**不报错**（因为不做此比较），停写模式必须**报错**（因为参照物是同快照）。
+**判据**：PBT-03/04/05 通过（截断、篡改头部、删表、改元信息 sha 都必须失败）。
 
 **回滚**：验证是只读行为。
 
@@ -440,13 +423,14 @@ v1.10 的完整事件链依赖 `system_events` / `migration_tx_notes` / 哈希�
 
 1. `KNOWN_FAILED`（事务已 ROLLBACK，能只读确认表结构未变）⇒ 标记 `schema_migrations.status='failed'`、`detail_json` 记原因。**注意：一旦 `failed` 落库，`migration_incomplete()` 即为 `True`（v1.10 语义：任一 `status <> 'success'` ⇒ True），`maintenance_state()` 因此返回 `RECOVERY_REQUIRED`，写入保持封锁。**
    - 业务**不得**在 `failed` 状态下继续可写；即使"确认事务已回滚、表结构未变"，也只是"损坏范围可控"，不是"可以解封"。
-   - P-1 唯一受支持的解除路径：恢复 `pre-migrate` 备份集（该快照产生于写 `running` **之前**，因此天然不含这一行 `failed`）→ L1/L2 校验 → 人工确认 → 删 `maintenance.json` → 重启 → 只读复核 → 才允许写入。
+   - P-1 唯一受支持的解除路径：运维**手动导入**迁移前自己导出的备份文件（`cli import --file <备份>`）→ 备份校验 → 维护保护 → 原子替换 → 复核 → 自动清维护态 → 重启 → 只读复核 → 才允许写入。程序不自动找备份、不自动恢复。
    - **不提供**"手工把 `failed` 改成 `success`"的 CLI 或自动改写；需要保留现场供分析时，就一直停在 `RECOVERY_REQUIRED`（只读 + 503），不牺牲正确性换取可用性。
 2. `OUTCOME_UNKNOWN`（`COMMIT` 已发出但结果不明）⇒ **不重试、不重放**，直接 `halt_migration("commit_outcome_unknown")`：写 maintenance + 封锁写入 + 非 DB 日志；`halt_tail` 显式校验 `maintenance_ok ∧ writes_blocked`，否则 `fatal_lockdown + fatal_exit`。
-3. 回滚动作顺序（严格）：停写 → 排空 → 关闭全部连接（不止线程本地）→ 用 `pre-migrate` 备份集恢复到同路径（原子替换 + 处理 `-wal`/`-shm`）→ L1/L2 校验 → 人工确认后清 `maintenance.json` → 重启 → 只读复核 → 允许写入。
+3. 恢复动作由运维**手动导入**执行（`cli import --file <备份文件>`），顺序固定：校验备份文件 → 维护态（已是 ACTIVE 则拒绝）→ 写封锁确认 → 排空 → 关闭全部业务连接 → `/proc` 句柄复核（有第三方持有 ⇒ 中止且不动文件）→ 移开 `-wal`/`-shm` → 同卷临时文件 + fsync → `os.replace` + 目录 fsync → 复核完整性/结构/逐表计数 → 成功才清维护态并解封。**没有**自动多级回退、没有恢复子进程、没有 `pre-restore` 链。
+   - 导入失败：原库以单个 `*.preimport-<stamp>.db` 副本留存并尽力复原；维护态与写封锁保持，报告 `import_*` 机器码；运维确认后才可再次导入或人工处置。
 4. **禁止**：迁移中途"再试一次"；halt 中追加任何数据库写入；`DROP` 任何业务表；用 `VACUUM` 代替恢复；把"确认未提交"当成"提交成功"。
 
-**触碰面**：`migrate.py`（`run()` / `rollback_to_snapshot()` / `set_phase_memory()`）、`db.py`（新增 `close_all_connections()`，见 §3.3）。
+**触碰面**：`migrate.py`（`run()` / `set_phase_memory()` / `halt_migration()`）、`backup.py`（`import_backup()`）、`db.py`（`close_all_connections()`，见 §3.3）。
 
 **判据**：PT-08/PT-09/PT-09b 通过；注入 12 类故障后，最终状态只能是"已回滚并正常服务"或"halt 且拒绝写入"。
 
@@ -526,12 +510,12 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 | `backend/database/db.py` | 修改（增量，**不动 `SCHEMA`**） | 新增 `connect_readonly()`、`table_exists()`、`close_all_connections()`（关闭全部线程连接，供恢复/迁移使用） |
 | `backend/config.py` | 修改（增量） | 新增 `STATE_DIR`（默认 `DATA_DIR/state`）、备份/迁移相关配置项 |
 | `backend/database/maint.py` | 新增 | `MAINT_FILE`、`MaintState`/`MaintRead`、`read_maint_file()`、`maintenance_state()`、`set_maintenance()`、`confirm_maint_write()`、`migration_incomplete()`、`selfcheck_state_dir()` |
-| `backend/database/backup.py` | 新增 | `snapshot_set()`（备份集三件套 + 原子发布）、`verify_set()`（L1/L2）、`restore_set()`（安全恢复全流程）、`prune()` |
-| `backend/database/migrate.py` | 新增 | `Phase`、`LEGAL_TRANSITIONS`、`VERSION_SEQ`、`current_version()`、`preflight()`、`record_baseline()`、`set_phase_memory()`、`halt_migration()`、`halt_tail()`、`run()`、`rollback_to_snapshot()`；`write_event()` 仅为**占位**（`raise NotImplementedError`） |
+| `backend/database/backup.py` | 新增 | `export_backup()`（单文件 + 元信息 + 导出即校验）、`verify_backup()`（L1/L2）、`import_backup()`（手动导入的文件级安全替换）、`holders_of()`、`latest_backup()` |
+| `backend/database/migrate.py` | 新增 | `Phase`、`LEGAL_TRANSITIONS`、`VERSION_SEQ`、`current_version()`、`preflight()`、`record_baseline()`、`set_phase_memory()`、`halt_migration()`、`halt_tail()`、`run()`；`write_event()` 仅为**占位**（`raise NotImplementedError`）。**不含** `rollback_to_snapshot()` / 恢复子进程 / `RESTORE_SEQUENCE` |
 | `backend/api/routes.py` | 修改（薄） | `/system/backup`、`/system/backup/download`、`/system/restore` 改调 `backup.py`；新增 `GET /api/system/migration/status`（只读） |
 | `backend/main.py` | 修改（薄） | 启动顺序：`selfcheck_state_dir()` → `maintenance_state()` → `init_db()` → 调度器；`/healthz` 加 `migration` 字段（状态码语义不变） |
 | `backend/scheduler/manager.py` | 修改（一行判定） | 每轮开始前 `maintenance_state()`，非 `INACTIVE` 直接 return（不读文件、不自行查库） |
-| CLI（`python -m backend.database.migrate`） | 新增 | `status/verify/snapshot/run/rollback`，全部受维护态约束 |
+| CLI（`python -m backend.database.cli`） | 新增 | `status/verify/backup/import/run`；`import` 自带维护保护，其余命令不写库（`run` 仅 dry-run 副本） |
 
 **不碰**：`backend/services/`（fetcher、builder）、`backend/testers/`、`backend/scoring/`、前端全部。节点身份、健康判定、评分、订阅下发规则零改动（`builder.publish()` 只在恢复后复用，语义不变）。
 
@@ -550,23 +534,24 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 
 | 接口 | 变化 |
 | --- | --- |
-| `POST /api/system/backup`、`GET /api/system/backup/download` | 实现换新（备份集），响应字段仍 `ok/file/size`，`file` 为备份集目录名 |
-| `POST /api/system/restore` | 改为走 `restore_set()` 的完整安全流程（见下） |
+| `POST /api/system/backup`、`GET /api/system/backup/download` | 改调 `export_backup()`（单文件 + 导出即校验）；响应字段 `ok/file/size/sha256/integrity_check`，`file` 为文件名 |
+| `POST /api/system/restore` | **下线为 409**（`manual_import_required`）：运行中进程不得在连接/写入活动时覆盖库文件，恢复统一走 CLI `import` |
 | `GET /api/system/migration/status` | 新增只读：`app_version`、`image_digest`、`schema_version`、`phase`、`maintenance_state`、`state_dir_ok`、`last_backup`（脱敏，不暴露绝对路径） |
 | `GET /healthz` | 增加 `migration` 字段；**状态码语义不变**（避免 docker healthcheck 抖动） |
 | 所有业务写接口 | 维护期 503（新增中间件，带 `reason`） |
 
-**`restore_set()` 的完整安全流程（逐步，缺一不可）**
+**`import` 的完整安全流程（逐步，缺一不可）**
 
-1. **停服**：把实例置于维护态并停止调度器；如为外部恢复，`docker stop nodepool` 之后再做文件操作（避免文件被打开）。
-2. **关闭所有数据库连接**：`close_all_connections()` 遍历并关闭本进程所有线程连接（不是只关当前线程的 `reset_connection()`），并置"连接池不可用"，此后任何 `connect()` 直接抛 `PoolClosed`。
-3. **确认没有其他进程句柄**：容器内 `/proc/*/fd` 扫描或 `fuser`，必须无 `/data/nodepool.db*` 的第三方持有者；有 ⇒ 中止恢复（`restore_handles_present`），不做任何文件替换。
-4. **处理 WAL/SHM**：确认无持有者后，删除 `nodepool.db-wal`、`nodepool.db-shm`（它们属于旧库）；此步必须在"无连接、无进程"前提下，否则会损坏数据。
-5. **临时恢复文件**：把上传/选定的备份集 `db` 复制到 `STATE_DIR` 同卷的临时文件 `restore-<nonce>.db`，`flush + fsync`，回读 `PRAGMA integrity_check` 与表集合校验。
-6. **原子替换**：`os.replace(tmp, DB_PATH)`（同卷 rename；跨设备会 `EXDEV`，因此临时文件必须落在同一文件系统），随后 `fsync(DB_PATH 所在目录)`。
-7. **失败回退**：替换前先做 `pre-restore` 备份集（同样三件套）；替换后若 `init_db()` 或 L1 校验失败 ⇒ 立即用 `pre-restore` 备份集再走一次 1–6，恢复原状；回退也失败 ⇒ 进入 `halt_migration("restore_failed")`，写入保持封锁，等人工处理。
-8. **恢复后校验**：`init_db()` → `PRAGMA integrity_check` → 逐表计数与备份 `manifest` 比对 → `builder.publish("restore")` → 解除维护态（人工确认）→ 重启 → 只读复核。
-9. 全程禁止：只 `reset_connection()` 就 `shutil.copy2` 覆盖（现有实现的做法）、在仍有连接时删 `-wal`、把 `latest.db` 当恢复源。
+1. **前置校验**：维护态必须是 `INACTIVE`（已在维护中说明有迁移未收尾，拒绝写第二个维护记录）；备份文件先过 L1/L2，无效即拒绝，此时**尚未**进入维护态、目标库零改动。
+2. **进入维护**：`set_maintenance()`（`migration_id=import-<stamp>`，`reason=manual_import`）→ 回读确认；失败即退出，不做文件操作。
+3. **停写**：`gate.apply_state(ACTIVE)` + `pool.block_writes()` + `confirm_writes_blocked()`；未确认 ⇒ 非零退出，绝不动文件。
+4. **排空**：`drain(rounds=2, min_interval=10.0)`；未通过 ⇒ 中止，维护态与封锁保持。
+5. **关闭全部连接**：`db.close_all_connections()`（不是只关当前线程）。
+6. **句柄复核**：`/proc/*/fd` 扫描目标库与 `-wal/-shm`；有第三方持有 ⇒ `import_handles_present`，中止且不替换。
+7. **WAL/SHM 与替换**：把 `-wal`/`-shm` 改名为 `*.preimport-<stamp>`（不删除，供复原）；原库单副本 `copyfile` + fsync 到 `*.preimport-<stamp>.db`；备份文件复制到同卷 `.import-<nonce>.db` + fsync + 复核；`os.replace` + 目录 fsync。
+8. **替换后复核**：独立只读连接 `integrity_check` → 表集合 → 结构摘要 → 逐表计数与**源备份文件**比对；不一致即复原并报 `import_verify_failed`。
+9. **收尾**：成功 ⇒ 清理空的 `-wal/-shm`、保留 `*.preimport-*.db` 供人工确认、删 `maintenance.json` + 目录 fsync + 复核 INACTIVE + 解除写封锁；失败 ⇒ 维护态与写封锁保持，报 `import_failed` / `import_rolled_back` / `import_failed_leftover`。
+10. 全程禁止：`reset_connection()` 后 `shutil.copy2` 覆盖（旧实现做法）、在仍有连接/句柄时删 `-wal`、把"上传文件"直接当恢复源、自动多级回退或恢复子进程。
 
 ### 3.4 配置
 
@@ -584,13 +569,13 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 
 | 风险 | 保护措施 |
 | --- | --- |
-| 迁移改表导致历史数据丢失 | P-1 不改任何业务表 DDL；真正改表只发生在 P0 之后，且必带 `pre-migrate` 快照 + L1/L2 验证 |
+| 迁移改表导致历史数据丢失 | P-1 不改任何业务表 DDL；真正改表只发生在 P0 之后，且升级前必须由运维手动导出 + 校验（程序不自动备份） |
 | 遗留 `tasks` 表被误删 | 迁移器中列入 `LEGACY_IGNORED = {"tasks"}`，任何 `DROP`/重命名白名单为空 |
 | `sqlite_sequence` 被重排 | 禁止对业务表做 `VACUUM INTO` 后替换主库；如需空间回收，单独评估且不在本阶段 |
 | 订阅文件与库不一致 | 维护期禁止发布；恢复后统一 `builder.publish("restore")`（沿用现有逻辑） |
 | 时间戳/时区 | 库内时间戳沿用现有 `now()`（本地时区字符串），P-1 不改口径；已知 B11（清理按 UTC 比较）留待 P-1 后期单独修，不在本轮 |
-| WAL 残留导致恢复不干净 | `restore_set()` 必须：停服/停调度 → `close_all_connections()`（全部线程，不止当前线程）→ 确认无其他进程句柄 → 删 `-wal`/`-shm` → 临时文件 fsync → 同卷原子替换 → 目录 fsync → `init_db()` → `checkpoint(TRUNCATE)` → L1 校验（详见 §3.3） |
-| 备份被误删 | `pre-migrate`/`pre-restore` 标记为受保护，滚动清理跳过 |
+| WAL 残留导致导入不干净 | `import` 必须：停写/排空 → `close_all_connections()` → 句柄复核 → `-wal`/`-shm` 改名隔离 → 同卷临时文件 + fsync → `os.replace` + 目录 fsync → 完整性/计数复核（详见 §3.3） |
+| 备份被误删 | 程序不自动清理、不自动删除；文件由用户保管，建议放独立目录并定期抽查 `verify` |
 
 ---
 
@@ -600,11 +585,11 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 
 | 编号 | 场景 | 通过判据 |
 | --- | --- | --- |
-| PT-01 | `snapshot_set()` 在 WAL 且有并发写时执行 | 备份 `integrity_check=ok`；未提交行不出现（【实测】5,000 行库 0.002s、`dirty` 行未进备份）；**不要求**与实时源库行数相等（在线模式见 PT-04b） |
-| PT-02 | `cp nodepool.db` 与备份 API 对比（教学用） | 证明 `cp` 得到"无表"库（【实测】已复现），写入计划文档防回归 |
-| PT-03 | `verify_backup()` L1 | 良好备份全绿；截断 1 KB / 篡改页 / 删除表 三种坏备份必须失败 |
-| PT-04 | L2（停写场景）行数与摘要比对 | 故意少 1 行 ⇒ 失败并报出表名 |
-| PT-04b | L2 参照物规则（在线备份场景） | 在线备份**不得**与"备份完成后的实时源库"比较：构造"实时库多 3 行" ⇒ 仍通过且不报警；停写场景同一构造 ⇒ 必须报警。用来钉死"参照物只能是同一快照" |
+| PBT-01 | `export_backup()` 正常导出 | 生成单个 `.db` + 同名 `.json`；`integrity_check=ok`；元信息 `sha256/db_bytes` 与实文件一致；目录里没有子目录/三件套 |
+| PBT-02 | 运行期导出一致性（WAL + 并发写） | 备份 `integrity_check=ok`；未提交行不出现；行数介于导出起止之间；**不要求**与实时源库相等 |
+| PBT-03 | `verify_backup()` L1 | 良好备份全绿；截断 / 头部损坏 / 删表 / 改元信息 sha 四种坏文件必须失败 |
+| PBT-04 | 元信息自洽（L2） | 元信息 `tables` 与备份文件逐表计数不符 ⇒ 失败；`structure_hash` 不符 ⇒ `meta_structure_mismatch` |
+| PBT-05 | 人工恢复演练（独立端口 8089） | 导入到独立副本 + 独立 `STATE_DIR` 起临时实例：`/healthz` 200、机场/节点/设置条数与元信息一致、订阅四格式可重建 |
 | PT-05 | L3 恢复演练（独立端口 8089） | `/healthz` 200；机场/节点/设置条数与源一致；订阅四格式可重建 |
 | PT-06 | `schema_migrations` 幂等 | 连续启动 5 次，行数恒为 1；`status='success'`；`seq` 不变 |
 | PT-06b | 版本排序 | 手工插入 `seq=1 version='1.9'`、`seq=2 version='1.10'`（均 success）⇒ `current_version()` 必须返回 `1.10`；把实现改成 `MAX(version)` 的负向对照必须失败 |
@@ -623,51 +608,44 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 | PT-14b | `STATE_DIR` 同卷校验 | `STATE_DIR` 与 `DB_PATH` 的 `st_dev` 不等 ⇒ `start_migration()` 拒绝（`state_dir_cross_device`），业务仍 200；`STATE_DIR == DATA_DIR` 的配置必须被拒绝启动检查拦下 |
 | PT-15 | 五入口 + 两会话封锁（A/B 表） | 维护期：HTTP 503、调度器停、池 `PoolClosed`、CLI 非零、`write_guard` 抛、重启仍 503；`RECOVERY_REQUIRED` 与 `ACTIVE` 行为分别命中 |
 | PT-16 | 停写排空 | `wal_checkpoint(TRUNCATE)=(0,0,0)`；两次探测间隔 ≥10s 均满足 |
-| PT-17 | 回滚剧本 | 从 `pre-migrate` 恢复后：行数/摘要一致、无 `-wal` 残留、订阅重建成功、`maintenance.json` 需人工确认才移除 |
+| PBT-06 | 正常导入 | 导入后逐表计数与备份一致；`maintenance.json` 已清、写封锁已解；导入后仍可继续写 |
 | PT-18 | 保守恢复（MC66(4)） | 删文件 + 非 `success` 行 ⇒ 五入口一致 `RECOVERY_REQUIRED`，写入不开放 |
 | PT-19 | 迁移窗口内重启 | 重启后仍 `RECOVERY_REQUIRED`/`ACTIVE`，不自动推进 phase、不补写事件 |
-| PT-20 | 性能预算 | 100 MB 库：快照 ≤ 5s、排空 ≤ 30s、总停写窗口 ≤ 60s（演练实测后回填实际值） |
-| PT-21 | 备份集原子交付 | 只留 `db` 不留 `manifest.json` ⇒ 该备份集判为无效、不进可用列表、不被清理删除；只留 `manifest` 不留 `db` 同样无效；`complete.json` 的 sha256 与实文件不符 ⇒ 无效 |
-| PT-22 | 恢复全流程 | 注入"仍有第三方句柄"⇒ 中止且不改文件；注入"替换后 `init_db()` 失败"⇒ 自动回退 `pre-restore` 且回到原库；全程断言 `-wal`/`-shm` 在替换前已清、替换是 `os.replace` 而非 `copy2` |
+| PBT-10 | 性能预算 | 100 MB 库：导出 ≤ 5s、排空 ≤ 30s、导入总停写窗口 ≤ 60s（实测回填） |
+| PBT-07 | 无效备份拒绝导入 | 坏文件/不存在 ⇒ `import` 非零退出且**不进入维护态**、目标库字节不变 |
+| PBT-08 | 导入期封锁与失败现场 | 替换瞬时断言 `writes_blocked` 且业务拿不到写槽；注入替换失败 ⇒ 原库复原、`*.preimport-<stamp>.db` 留存、维护态与封锁保持；有第三方句柄 ⇒ 中止且不改文件 |
 | PT-23 | A/B 职责分离（五入口 + 二次级机制） | 连接池与 `halt_tail` 的代码路径中**静态扫描**无 `MAINT_FILE`/`read_maint_file` 引用；五入口全部引用同一 `maintenance_state()` |
 | PT-24 | 探针脚本副作用审计 | 第 1–4、6–8 段在一次性副本库上执行，前后 `sha256(db)`、`-wal` 大小、`mtime` 均不变；第 5 段只在 `STATE_DIR` 造文件、不触碰 `nodepool.db*` |
 | PT-25 | `migration_incomplete()` 语义保持 | 表不存在 ⇒ `False`；有 `running`/`failed` ⇒ `True`；查询异常 ⇒ `MaintUnverifiable`；空表的"拒绝迁移"只由 preflight 产生，不改该函数返回值 |
-| PT-26 | 清理策略保护 | `pre-migrate`/`pre-restore` 在滚动清理中永不被删；半成品备份集 24 小时内不被删 |
+| PBT-09 | WAL/SHM 与迁移解耦 | 目标库带遗留 `-wal/-shm`（伪造脏帧）时导入成功且旧帧不残留；迁移 dry-run 期间 `BACKUP_DIR` 零新增文件 |
 
 判据统一口径：**每一项必须给出"命令 + 期望输出 + 不通过时的处置"**；"跑通了"不算通过，必须贴输出。
 
 ---
 
-## 6. 备份恢复验证步骤（可照做）
+## 6. 备份与导入验证步骤（可照做）
 
-1. 停写：置维护态（`maintenance.json`）→ 等后台任务本轮结束 → `wal_checkpoint(TRUNCATE)`。
-2. 快照：`migrate snapshot --stage pre-migrate` → 得到备份集目录 `nodepool-<stamp>-pre-migrate/`（`db` + `manifest.json` + `complete.json` 三件齐全）。
-3. 验证：`migrate verify --set <备份集目录>` → L1 结构 + L2（停写场景下与同快照的源库计数等值；`manifest` 的计数必须由同一份备份文件读出）。
-4. 副本演练：把备份集的 `db` 拷到 `/tmp/restore-check/`，起临时容器 `-p 8089:8080`、`NODEPOOL_DB` 指向副本、`NODEPOOL_MIGRATION_ENABLED=0`、`NODEPOOL_STATE_DIR` 指向临时空目录。
-5. 核对：登录 → 机场数/节点数/设置项数 → 打开一个订阅 URL 取四种格式 → 与生产计数比对。
-6. 收尾：停临时容器、删副本、删临时备份目录；生产仍保持维护态。
-7. 正式迁移：`migrate run` → phase 推进 → `success` 落库。
-8. 解除维护：人工确认 → 删 `maintenance.json` → 重启 → 只读接口核对 → 允许写入 → 观察 30 分钟（`logs` 中 5xx 与 503 计数归零、批次正常）。
-
-每步都有独立的中止点：1–6 任一失败 ⇒ 回滚到步骤 1 之前的状态（生产从未被写过），不影响服务。
-
----
+1. 导出：`python -m backend.database.cli backup --out /backup/manual` → 得到 `nodepool-<stamp>-manual.db` 与同名 `.json`；命令输出 `integrity_check=ok`。
+2. 校验：`python -m backend.database.cli verify --file <文件>` → `ok=true`；再故意截断一份副本，确认 `ok=false` 且报 `integrity_check`/`sqlite_error`。
+3. 演练：把该 `.db` 复制到 `/tmp/restore-check/`，起临时实例（`-p 8089:8080`、`NODEPOOL_DB` 指向副本、`NODEPOOL_STATE_DIR` 指向临时空目录、`NODEPOOL_MIGRATION_ENABLED=0`），验证 `/healthz` 200、机场/节点/设置条数与元信息一致、订阅四格式可重建；完成后停实例、删副本。
+4. 真机导入（仅在维护窗口）：停应用/容器 → `python -m backend.database.cli import --file <文件>` → 观察 `steps` 依次为 `source_verified/maintenance/stop_writes/drain/close_connections/import_atomic/verify_imported/release` → 重启 → 只读复核（`status` 为 `INACTIVE`、`verify` 为 `ok`）。
+5. 失败处置：命令以非零退出并给出 `import_*` 机器码时，**不要**改库、不要重复导入；先看 `*.preimport-<stamp>.db` 与 `migration-fault.log`，人工确认后再决定。
 
 ## 7. 失败处理与回滚矩阵
 
 | 编号 | 失败点 | 立即动作 | 最终状态 | 恢复手段 |
 | --- | --- | --- | --- | --- |
-| F1 | 快照失败（空间/IO） | `halt_migration("snapshot_failed")` | 写入封锁 + `HALTED` | 清维护态前先修磁盘；业务保持只读 |
-| F2 | 快照验证 L1/L2 失败 | 同上 | 同上 | 换备份策略，不迁移 |
+| F1 | 手动导出失败（空间/IO/校验不过） | 删除临时文件、非零退出且不改库 | 业务不受影响 | 换目录/清理空间后重导 |
+| F2 | 导出后校验失败 | 不落名、删临时文件 | 业务不受影响 | 重新导出；持续失败查磁盘/库 |
 | F3 | `schema_migrations` 写 `running` 失败 | 事务已回滚，只读确认**无** `running`/`failed` 行残留 | 可返回原状（服务可写） | 直接重启；若复查发现残留行 ⇒ 立即降级为 F4 |
-| F4 | DDL 执行抛错 | 事务 ROLLBACK → 判 `KNOWN_FAILED` → 标 `failed` | **写入封锁**：`failed` ⇒ `migration_incomplete()`=True ⇒ `RECOVERY_REQUIRED`（503） | 恢复 `pre-migrate` 备份集 → L1/L2 → 人工确认清维护态 → 重启 → 只读复核 → 才解封 |
+| F4 | DDL 执行抛错 | 事务 ROLLBACK → 判 `KNOWN_FAILED` → 标 `failed` | **写入封锁**：`failed` ⇒ `migration_incomplete()`=True ⇒ `RECOVERY_REQUIRED`（503） | 运维手动 `import --file <迁移前导出>` → 复核 → 自动清维护 → 重启 → 只读复核 → 才解封（无自动恢复链） |
 | F5 | 提交结果不确定 | 判 `OUTCOME_UNKNOWN` → `halt_migration("commit_outcome_unknown")` | 写入封锁 | 只读比对表结构与 `schema_migrations` → 人工决策（P-1 无事件表可重查） |
 | F6 | `set_maintenance` 失败 | 继续封锁 → `fatal_exit("maintenance_unconfirmed")` | 进程退出，写入已被挡 | 修复后重启，走 `RECOVERY_REQUIRED` |
 | F7 | 写入封锁无法确认 | `fatal_lockdown` + `fatal_exit("writes_block_unconfirmed")` | 进程退出 | 停容器（`docker stop`）后离线恢复 |
 | F8 | 维护文件损坏/不可读 | `RECOVERY_REQUIRED` | 只读 + 503 | 人工修复或按 DB 判定后清理 |
 | F9 | 恢复后订阅重建失败 | 记 `WARN`，不阻断启动 | 业务可写，订阅可能是旧版 | 手动重发 `builder.publish` |
-| F10 | 恢复时仍有第三方句柄 | 中止恢复（`restore_handles_present`） | 原库不动 | 停容器后重试 |
-| F11 | 备份集缺 `manifest`/`complete` | 判无效，不进恢复候选 | 业务不受影响 | 重新备份 |
+| F10 | 导入时仍有第三方句柄 | 中止（`import_handles_present`），原库不动 | 维护态保持 | 停容器/停进程后重试 |
+| F11 | 备份文件损坏/被截断 | `import` 前置校验拒绝（`backup_invalid`） | 业务不受影响、库零改动 | 换可用备份 |
 
 原则：**任何失败都不允许"继续以可写状态对外服务"**；退出的进程绝不靠上层重试拉起（`restart: unless-stopped` 会让容器重启，但那只是重启，不是解封）。
 
@@ -679,11 +657,11 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 | --- | --- | --- | --- |
 | P-1.1 | 生产探针（§1.3，P-1~P-10）与基线存档 | 只读（P-7 例外） | 十项输出逐项回填 §1.2.7；每项判据通过；P-7 与 P-10 缺一即不得进 P-1.2 |
 | P-1.2 | `schema_migrations`（含 `seq`）+ **迁移器事务内**建表与原子基线登记 | 可 `DROP TABLE` | PT-06/06b/06c/06d/06e 通过；`init_db()` 不建该表；基线 `version` 由 P-10 实测值确定；17 张业务表零变化 |
-| P-1.3 | `backup.py`（备份集三件套 + `verify_set`） | 删文件 + 开关回退 | PT-01/03/04/04b/21 通过 |
+| P-1.3 | `backup.py`（单文件导出 + 完整性校验） | 删文件 | PBT-01/02/03/04/05 通过 |
 | P-1.4 | `maint.py` + `STATE_DIR` 同卷校验 + 启动自检 | 删文件 | PT-11/14/14b/24 通过 |
 | P-1.5 | 五入口 + 二次级机制接线（A/B 分离） | 拆中间件 | PT-15/16/23 通过 |
 | P-1.6 | `migrate.py` 最小状态机（无事件链）+ 空迁移 dry-run | 删文件 | PT-09b/12/13/19/25 通过；`write_event()` 抛 `NotImplementedError` |
-| P-1.7 | 全链路演练（副本库 + 临时容器 8089） | 不影响生产 | PT-05/07/08/17/18/20/22/26 通过 |
+| P-1.7 | 手动导入 + 维护保护 + 失败现场（隔离演练 8089） | 不影响生产 | PBT-05/06/07/08/09/10 通过；P-1.6 迁移测试不回归；无自动恢复链残余 |
 | P-1.8 | 生产窗口（**需二次确认**，本轮不做） | 快照 + 回滚剧本 | 步骤 §6 全程无 5xx 毛刺，30 分钟观察通过 |
 
 每步之间必须停下汇报，不得连做。P-1.1 之前不允许写任何代码。
@@ -697,11 +675,11 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 | 1 | 维护期 503 | 全部业务写接口 | 窗口选在 `sub_publish` 之外（查 `next_at`），时长 ≤ 60s |
 | 2 | 停写导致后台批次中断 | 当轮测试/评分缺失 | 允许丢失一轮（90 分钟 TTL 内自然补上），不做补偿写入 |
 | 3 | 容器重启 | `restart: unless-stopped` 会拉起，前端短暂不可用 | 窗口内提前通知；重启后先只读观察 |
-| 4 | 备份占用磁盘 | `data`/`backup` 同盘时可能写满 | 快照前检查余量 ≥ 3× 库大小且 ≥ 2 GB，超限拒绝迁移 |
+| 4 | 备份占用磁盘 | `data`/`backup` 同盘时可能写满 | 导出前检查余量 ≥ 2× 库大小 + 8 MB；不足即拒绝导出 |
 | 5 | NAS 卷不支持原子 rename | maintenance 失效、`RECOVERY_REQUIRED` 误判 | P-7 自检前置；不支持则禁用迁移入口（业务不受影响） |
-| 6 | WAL 未截断就恢复 | 恢复后库"看起来旧" | 恢复流程强制删 `-wal`/`-shm` 并 `checkpoint(TRUNCATE)` |
+| 6 | WAL 残留导致导入后读旧数据 | 导入后库"看起来旧"或损坏 | 导入先把 `-wal/-shm` 改名隔离（不删，供复原），替换后再复核完整性/计数 |
 | 7 | `tasks` 等遗留表被误动 | 历史数据丢失 | 迁移白名单 + 明确忽略清单 + 演练逐表比对 |
-| 8 | 迁移器 bug 导致半写 | 库结构不可用 | phase 状态机 + `halt` + 快照回滚，三保险 |
+| 8 | 迁移器 bug 导致半写 | 库结构不可用 | phase 状态机 + `halt` + 运维手动导入备份，三保险 |
 | 9 | 订阅文件与库版本错位 | 用户拿到旧订阅 | 恢复后统一 `publish("restore")`，并在 `/api/system/migration/status` 暴露 `last_publish` |
 | 10 | 探针写测试（P-7）误伤 | 极低（64 字节临时文件 + 可能新建空 `STATE_DIR`） | 随机文件名、`finally` 清理、不触碰 `nodepool.db*`、目录为空则一并删除 |
 | 11 | 把 `wal_checkpoint` 当只读操作误用 | 会在任意时刻改动 `-wal`，干扰排查甚至抢锁 | 只读探针禁止 checkpoint；checkpoint 只出现于停写窗口（PT-24 审计） |
@@ -709,7 +687,7 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 | 13 | 基线版本猜错（凭 commit 推断） | 版本记录与真实运行版本不符，后续迁移误判 | 基线必须用 P-10 实测（tag/digest/`config.VERSION`/`healthz`）并核对结构摘要 |
 | 15 | `/healthz` 无版本字段却被当作"已核对" | 四值核对失真 | 实测无该字段即记 `ABSENT`，降级三值 + 标记待补能力，不得宣称四值完成 |
 | 16 | 通用 `init_db()` 提前建空 `schema_migrations` | 迁移器读到空表永久拒绝迁移（启动即锁死） | 该表不进 `SCHEMA`，只由迁移器入口事务创建（PT-06e 钉住） |
-| 14 | 备份集"有库无清单"被当有效 | 恢复时缺校验依据 | 三件齐全判据 + 半成品 24h 保护（PT-21） |
+| 14 | 备份文件损坏仍被当有效 | 导入后数据不全 | 导出入即校验 + 导入前复校 + 元信息 sha（PBT-03/04/07） |
 
 ---
 
@@ -728,4 +706,4 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 
 **待补能力（本轮不改，登记备查）**：若 P-10 实测显示 `/healthz` 没有版本字段，则"健康端点自带版本"属能力缺口，记为待补（P-1 后的独立小改动，不进本轮范围）；在此之前基线版本只能靠 `config.VERSION` + image digest 三值确定，且**不得**对外声称已做四值核对。
 
-本轮修正说明（相对上一版）：P-10 补齐 `/healthz` 实测命令与"四值核对规则"（无版本字段则降级三值并标待补）；P-5 改为同一只读连接双读 `data_version` 并输出 `before/after/changed`；`schema_migrations` 从 `db.py` 的 `SCHEMA` 移出，改由迁移器入口事务建表+基线+计数校验（PT-06e 钉死无"先建空表"路径）；`structure_hash` 把 `tasks` 摘出主摘要、独立记账并保留双合法结构（PT-06d 增四个子用例）；`failed` 状态统一为"写入封锁 + `RECOVERY_REQUIRED`"，唯一解封路径=恢复 `pre-migrate` 备份集。更早一轮的修正：P-5 拆成"句柄/锁/未提交事务"三件事并删除只读探针里的 `wal_checkpoint`；P-7 修正 fsync 的 fd 用法并补齐"写入→文件 fsync→rename→目录 fsync→回读→删除→再 fsync"，且强制在真实 `STATE_DIR` 上跑；`STATE_DIR` 改为独立子目录 + 同卷校验；六通道按 A/B 重排；P-1 明确只实现最小状态机（不建事件表、不冒充完整事件链）；`schema_migrations` 增加 `seq` 排序键、基线原子登记并强制与实测版本核对；L2 参照物限定为同一快照；备份改为"三件套 + 原子发布"；恢复流程补全停服/全连接关闭/句柄确认/WAL 处理/原子替换/失败回退。
+**v1.10 备份/导入简化修订（本版）**：删除自动恢复体系——`snapshot_set()` 三件套/`complete.json`/`restore_set()`/`prune()`/`pre-restore` 多级回退/恢复子进程/`rollback_to_snapshot()`/`RESTORE_SEQUENCE`/`migrate.run(snapshot=True)` 全部移除；改为"手动导出单文件 + 手动导入 + 完整性校验 + 导入期维护保护"。备份与迁移彻底解耦：迁移失败不自动恢复、不自动找备份。测试编号 PT-01/02/03/04/04b/17/21/22/26 由 PBT-01…09 取代（原编号保留在历史交付材料中，不再对应当前实现）。更早的修正说明（相对上上版）：P-10 补齐 `/healthz` 实测命令与"四值核对规则"（无版本字段则降级三值并标待补）；P-5 改为同一只读连接双读 `data_version` 并输出 `before/after/changed`；`schema_migrations` 从 `db.py` 的 `SCHEMA` 移出，改由迁移器入口事务建表+基线+计数校验（PT-06e 钉死无"先建空表"路径）；`structure_hash` 把 `tasks` 摘出主摘要、独立记账并保留双合法结构（PT-06d 增四个子用例）；`failed` 状态统一为"写入封锁 + `RECOVERY_REQUIRED`"，唯一解封路径=恢复 `pre-migrate` 备份集。更早一轮的修正：P-5 拆成"句柄/锁/未提交事务"三件事并删除只读探针里的 `wal_checkpoint`；P-7 修正 fsync 的 fd 用法并补齐"写入→文件 fsync→rename→目录 fsync→回读→删除→再 fsync"，且强制在真实 `STATE_DIR` 上跑；`STATE_DIR` 改为独立子目录 + 同卷校验；六通道按 A/B 重排；P-1 明确只实现最小状态机（不建事件表、不冒充完整事件链）；`schema_migrations` 增加 `seq` 排序键、基线原子登记并强制与实测版本核对；L2 参照物限定为同一快照；备份改为"三件套 + 原子发布"；恢复流程补全停服/全连接关闭/句柄确认/WAL 处理/原子替换/失败回退。
