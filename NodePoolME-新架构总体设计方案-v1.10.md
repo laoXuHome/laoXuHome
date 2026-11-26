@@ -11,6 +11,8 @@
 **四次修订（S2 异常保护）**：`in_transaction` 读取、`quarantine()`、回滚通道各自独立异常边界；`close()` 兜底必执行；隔离失败即 K1=False，严格按 T6′ 处理。改动点见 §0.3。
 **五次修订（Final State-Machine Closure）**：① 拆开路径 α（进程内 COMMIT 异常，先 T6 → UNKNOWN，再只走 T7/T8）与路径 β（崩溃恢复，直接从 `COMMIT_ATTEMPTED` 走 T4/T5），`T4/T5` 不再出现在异常路径；② 关闭接口统一为 `conn_wrapper.close()`，`is_closed` 只在底层成功后置位。改动点见 §0.4。
 **六次修订（β′ 跨重启证据）**：T6 事件必须持久化 `k1_proof`、`s5_result`、单调 `s5_failed_ever` 等证据；β′ 启动必须 E1–E3 校验，不得凭 `phase=UNKNOWN` 推断 K1 历史；S5 失败历史永久可追溯且不可清除。改动点见 §0.5。
+**八次修订（Evidence Integrity Closure）**：① `token_fp` 改为 `system_events` 独立列并接入真实 `INSERT` 与 β′ 校验；② `tx_local` 拆到 `migration_tx_notes`，消除与 DDL 的 3 列 INSERT 冲突；③ `write_event` 在 `BEGIN IMMEDIATE` 内做 C1–C8 全链校验后再追加；④ 路径 α/β′ 均在 `set_phase` 前执行 `hist_gate`（`s5_failed_ever` 永久禁止 T7/T8）。改动点见 §0.7。
+
 **七次修订（Evidence Write-Path Integration）**：`system_events` 增加 `migration_id/seq/prev_sha/s5_failed_ever` 一等列与两个 UNIQUE；`write_event` 成为唯一写入通道，T6 证据在写入前构造校验；`append_reason` 同步接入；哈希链与单调性在 `BEGIN IMMEDIATE` 内保证。改动点见 §0.6。
 
 ---
@@ -66,7 +68,17 @@
 | 后续事件统一接入 | §1.2 `append_reason` 伪代码 + 强制约束表 | 全部走 `write_event`；带 `migration_id`/`s5_failed_ever`/`seq`/`prev_sha`；单调性违反拒写 |
 | 哈希链与原子性 | §2.1 规范化规则 + 原子性说明 + DDL 两个 UNIQUE | `seq` 从 1、连续 +1、`UNIQUE(migration_id,seq)`；`prev_sha` 首事件 `GENESIS(mid)`；`BEGIN IMMEDIATE` 事务边界；失败不推进 phase、不提交内存标记；断链不重建 |
 | note 三态 | §1.4 三分支表 | 链完整才写 note；链断裂只写文件日志；单调性不满足拒写 |
-| 测试 | MC38–MC43 | 校验真实持久化行，非内存 payload |
+| 测试 | MC38–MC43 |
+
+### 0.7 八次修订改动点（Evidence Integrity Closure）
+
+| 项 | 位置 | 改动 |
+| --- | --- | --- |
+| P0-1 `token_fp` 写入路径 | §1.4 字段表/E2、§2.1 DDL + 字段来源表 + `write_event` + `required_evidence_missing`、§2.2 `evidence_ok`、MC38/MC43 | 全篇唯一口径 = `system_events.token_fp` 独立列（`CHECK(length=64)`）；来源锁定凭据行；β′ 读列值比对；缺失/格式错/不符一律拒绝 |
+| P0-2 `tx_local` 冲突 | §2.1 两表 DDL + `emit_event` 双后端 + 语义对照、§5 注、MC39/PH7 | 新增 `migration_tx_notes`（无 `seq/prev_sha/token_fp/s5_failed_ever` 列）；tx_local 不进证据链、β′ 不读；不再有与 DDL 冲突的 3 列 INSERT |
+| P0-3 全链验证入事务 | §2.1 `write_event` + C1–C8 + 不确定结果处理表；§1.2 `append_reason` 降级为诊断 | `BEGIN IMMEDIATE` 内读全链并校验，通过才分配 `seq`/`prev_sha`；链损坏只写文件日志；结果不确定只读重查、禁止重发 |
+| P0-4 历史失败门禁 | §2.2 `hist_gate` + 顺序说明 + T8 说明、§2.3 新行、MC44–MC47 | `not rec.s5_failed_ever` 在 `set_phase` 前判定；T7/T8 同受约束；写入拒写 ≠ 状态禁止，两者分别定义 |
+| 一致性 | §6.8、§8 六项核对、§10 风险 22–25 | DDL/INSERT 对齐、事务边界、统一机制、`token_fp` 落库、β′ 恢复、门禁覆盖 | 校验真实持久化行，非内存 payload |
 
 ### 0.3 四次修订改动点（S2 异常保护）
 
@@ -123,26 +135,24 @@
 **`append_reason()`（不改变 phase 的唯一合法方式）**
 
 ```python
-# 伪代码：与 migration_phase 共用同一套证据/链/单调机制
+# 伪代码：migration_note 走同一 durable 入口（全链校验在 write_event 事务内完成）
 def append_reason(rec, code, detail):
     """在 phase 不变的前提下追加上下文；不允许伪装成状态转换。"""
-    if not verify_chain(MID):                            # 与 §1.4 E2 同一套校验
-        non_db_log("note_chain_broken", code)            # 不伪造链、不覆盖历史
-        return False
-    payload = dict(phase=rec.phase.name, code=code, detail=detail,
-                   schema_version=EVIDENCE_SCHEMA_VERSION)
-    return write_event(rec, "migration_note", payload)   # 统一入口：seq+1、prev_sha、单调校验
+    payload = dict(phase=rec.phase.name, code=code, detail=detail)
+    return write_event(rec, "migration_note", payload)    # 链损坏 → 内部拒绝，只写文件日志
 ```
 
-**所有写入入口的强制约束（`migration_phase` / `migration_note` / 其他审计事件一律适用）**
+**所有写入入口的强制约束**
 
 | 约束 | 说明 |
 | --- | --- |
-| `migration_id` 必带 | 无 `migration_id` 的事件视为无效，不得写入 |
-| `s5_failed_ever` 必带且单调 | 由统一入口计算"历史 OR 本次"，写前校验；倒退即 `EvidenceMonotonicityViolation`，拒写 |
-| `seq` / `prev_sha` 必带 | 由统一入口在写事务内生成，调用方**不得**传入 |
-| 规范化/哈希唯一 | 全部走 §2.1 的 `canon()` 与 `sha256_hex()`，不得另写一套 |
-| 链断裂时的 note | 只写 `migration-fault.log`，**不得**为写 note 而重建或覆盖链 |
+| 入口唯一 | `durable` 事件只能经 `write_event()`（`emit_event` 的 durable 后端）；`tx_local` 只能经 `write_tx_event()`，落 `migration_tx_notes`，不进链 |
+| `migration_id` / `token_fp` / `seq` / `prev_sha` / `s5_failed_ever` 必带（durable） | 由 `write_event` 在事务内生成并写入独立列；调用方不得传入 |
+| `s5_failed_ever` 单调 | 写前校验 + 事务回滚；倒退即 `EvidenceMonotonicityViolation` |
+| 全链校验前置 | `verify_full_chain`（C1–C8）在同一 `BEGIN IMMEDIATE` 内执行，通过后才分配 `seq`/`prev_sha` |
+| 规范化/哈希唯一 | 全部走 §2.1 的 `canon()` / `canon_event_row()` / `sha256_hex()` |
+| 链断裂时的 note | 只写 `migration-fault.log`；**不得**为写 note 而重建、补写、重算、覆盖或删除历史 |
+| 预检查不等于安全保证 | `append_reason` 可在事务外做诊断性 `verify_chain()`，但**唯一安全校验**由 `write_event` 事务内完成 |
 
 **为什么必须这样**：`UNKNOWN → UNKNOWN` 在状态机里是无操作，但若写成 `set_phase(UNKNOWN, UNKNOWN)` 会触发旧值断言/守卫（`PhaseMismatch`），把"记录新原因"误当成"状态变化"。记录原因与状态推进是两件事。
 
@@ -150,7 +160,7 @@ def append_reason(rec, code, detail):
 
 | 事件 | 时点 | 是否允许独立写连接 | 说明 |
 | --- | --- | --- | --- |
-| `PREPARED→TX_OPEN`、`TX_OPEN→COMMIT_ATTEMPTED` | 事务内即时写 | **否**（写在迁移事务里，`tx_local`） | 随提交或回滚消失，非持久审计 |
+| `PREPARED→TX_OPEN`、`TX_OPEN→COMMIT_ATTEMPTED` | 事务内即时写 `migration_tx_notes` | **否**（写在迁移事务里，`tx_local`；不进 `system_events`） | 随提交或回滚消失，非持久审计；**β′ 不读该表** |
 | `COMMIT_ATTEMPTED→UNKNOWN`（路径 α） | **S2–S5 全部完成之后，且 K1 成立** | 是（此刻原连接已关闭、S5 已探测） | 唯一允许的时点；K1 不成立则不写（T6′） |
 | `COMMIT_ATTEMPTED→COMMITTED` / `→TX_ROLLED_BACK`（路径 β） | 恢复流程 R2–R3 完成之后，且 `K1_β` ∧ S5 成立 | 是 | 路径 β 的**首个** durable 事件即该结论事件；不得为"先降级"再写 `→UNKNOWN` |
 | `TX_OPEN→TX_ROLLED_BACK` | `ROLLBACK` 返回之后 | 是 | 原写事务已结束 |
@@ -209,13 +219,13 @@ def append_reason(rec, code, detail):
 | `s5_result` | `"ok"` / `"failed"` / `"not_run"` | 用于解释当次探测；`not_run` 不得当作 `ok` |
 | `s5_failed_ever` | 布尔，**单调不减** | 见下方"历史失败标记" |
 | `seq` / `prev_sha` | 事件序号与上一事件规范化 JSON 的 sha256 | `seq` 必须连续 +1、`prev_sha` 必须与上一事件匹配；断链即判"证据不可验证" |
-| `ts` / `token_fp` | 事件时间、token 指纹（不含 token 明文） | `ts` 必须落在该迁移时间窗内；`token_fp` 与凭据行一致 |
+| `ts` / `token_fp` | 事件时间；`token_fp` 为 `system_events.token_fp` **独立列**（64 位小写 hex，非 `detail_json` 内字段） | `ts` 必须落在该迁移时间窗内；`token_fp` 必须是 `^[0-9a-f]{64}$` 且等于当前凭据行重算值；缺失/格式错/不一致一律判失败 |
 
 **S5 失败历史（跨进程、跨重启、不可清除）**
 
 1. `s5_failed_ever` 一旦为 `true`，**永久为 `true`**：后续任何 `migration_phase` 与 `migration_note` 事件都必须携带"≥ 旧值"的该字段，写入前校验单调性，违反即拒绝写事件（`EvidenceMonotonicityViolation`）；
 2. `S5` 后续成功**不得**清除该标记：成功只允许追加 `probe_ok` 记录（`s5_result="ok"`、`s5_failed_ever` 沿用旧值），**禁止**写任何"清除/重置"语义的事件；
-3. β′ 恢复时取该 `migration_id` 全部事件中 `s5_failed_ever` 的**逻辑或（任一 true 即 true）**，恢复为 `s5_failed = True`；
+3. **该标记对路径 α 与 β′ 同等生效**：α 在同一进程内保留 `rec.s5_failed_ever`（由成功写入链后提交），β′ 恢复时取该 `migration_id` 事件链中 `s5_failed_ever` 列的**逻辑或（任一 true 即 true）**，恢复为 `s5_failed = True`；
 4. 该状态**不得**存放在仅进程内存或普通易失日志中；`migration-fault.log` 只作辅助排查，不作为 β′ 的判定依据。
 
 **β′ 启动校验（E1–E3，全过才允许 T7/T8）**
@@ -223,8 +233,8 @@ def append_reason(rec, code, detail):
 | 检查 | 条件 | 不通过时 |
 | --- | --- | --- |
 | E1 存在性 | 该 `migration_id` 存在 `migration_phase` 事件且 `new_phase=UNKNOWN`、`old_phase=COMMIT_ATTEMPTED` | **禁止** T7/T8 |
-| E2 完整性 | `k1_proof` 四布尔全 `true`、`seq/prev_sha` 链完整、`token_fp`/`ts` 一致、字段无缺失 | **禁止** T7/T8；判"无法验证 K1 历史证明" |
-| E3 一致性 | 当前 `phase` 与 T6 事件的 `new_phase` 一致；`s5_failed` 由事件流恢复（不由 phase 推断） | **禁止** T7/T8 |
+| E2 完整性 | `k1_proof` 四布尔全 `true`；`seq/prev_sha` 全链一致（C1–C8）；`token_fp` **列值**为 64 位小写 hex 且等于凭据行重算值；`ts` 落在迁移时间窗；字段无缺失 | **禁止** T7/T8；判"无法验证 K1 历史证明 / token 指纹不符" |
+| E3 一致性 | 当前 `phase` 与 T6 事件的 `new_phase` 一致；`s5_failed` 由 `system_events.s5_failed_ever` 列（单调取最后值）恢复，不由 phase 推断、不读 `migration_tx_notes` | **禁止** T7/T8 |
 
 任一项不通过 → **停留 `UNKNOWN`**，不推进 phase、不进入阶段 C、不写 success、maintenance 保持、写入关闭。
 
@@ -232,7 +242,7 @@ def append_reason(rec, code, detail):
 
 | 情形 | 处理 |
 | --- | --- |
-| 证据链**完整可验证**、只是 E2 某个内容项不符（如 `token_fp` 不匹配） | 允许写一条 `migration_note(code="evidence_unverified")`，走 §2.1 统一入口：继承当前 `s5_failed_ever`、`seq = last.seq + 1`、`prev_sha = sha256(canon(上一事件))` |
+| 证据链**完整可验证**、只是 E2 某个内容项不符（如 `token_fp` 不匹配） | 允许写一条 `migration_note(code="evidence_unverified")`，走 §2.1 `write_event`：继承当前 `s5_failed_ever`、`seq = last.seq + 1`、`prev_sha = sha256(canon_event_row(上一事件))`、`token_fp` 取当前凭据行 |
 | 证据链**本身损坏/断裂**（缺行、`prev_sha` 对不上、`seq` 跳号、无法读到上一事件） | **禁止**写 DB note（写 note 会需要伪造前序哈希）；只写 `<data_dir>/migration-fault.log`，附 `mid / 失败项 / 观测到的链头` |
 | 证据链可读但 `s5_failed_ever` 单调性无法满足（历史 true、待写 false） | 拒写（`EvidenceMonotonicityViolation`），只落文件日志 |
 
@@ -269,169 +279,244 @@ def append_reason(rec, code, detail):
 
 ## 2. P0-3：`set_phase()` 的事件失败补偿
 
-### 2.1 事件先写、状态后改（唯一顺序），证据随事件一起构造校验
+### 2.1 事件先写、状态后改；tx_local 与 durable 分表分语义，证据随事件构造校验
 
-**统一事件写入通道（所有 `migration_phase` / `migration_note` 只能经此落库）**
+**两张表：durable 证据链 vs tx_local 提示（本轮定稿）**
 
-`system_events` 在 v1.2 起就是本设计新建的表（基准库不存在）。为承载证据链，其设计列为：
+`system_events` 自 v1.2 起就是本设计新建的表（基准库不存在）。`tx_local` 事件必须随迁移事务提交/回滚，不能进 durable 链；而 durable 链要求 `migration_id/seq/prev_sha/token_fp/s5_failed_ever` 全部 NOT NULL。把两者塞进一张表只能靠可空列 + 伪造序号，因此**拆成两张表**，语义各自闭合。
 
 ```sql
 -- 设计级 DDL（不是现网表；P-1 实施时才建）
+
+-- ① durable 证据链：唯一可被 β′/T7/T8/T4/T5 采信的来源
 CREATE TABLE system_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    event           TEXT NOT NULL,        -- 'migration_phase' | 'migration_note' | ...
+    migration_id    TEXT NOT NULL,
+    seq             INTEGER NOT NULL,     -- 每 migration_id 内从 1 起，连续 +1
+    prev_sha        TEXT NOT NULL,        -- 上一事件规范化 JSON 的 sha256；首事件为 GENESIS(mid)
+    token_fp        TEXT NOT NULL CHECK (length(token_fp)=64),   -- 64 位小写 hex；T6 必填
+    s5_failed_ever  INTEGER NOT NULL CHECK (s5_failed_ever IN (0,1)),
+    detail_json     TEXT NOT NULL,        -- 事件正文（含 k1_proof / s5_result 等证据）
+    ts              TEXT NOT NULL,        -- ISO-8601 UTC，毫秒
+    UNIQUE (migration_id, seq),           -- 数据库级唯一：并发下不可能重复 seq
+    UNIQUE (migration_id, prev_sha)       -- 同迁移不允许两个事件共享前序（防分叉）
+);
+
+-- ② tx_local 提示：随迁移事务存在，回滚即消失，永不进入证据链
+CREATE TABLE migration_tx_notes (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    event         TEXT NOT NULL,          -- 'migration_phase' | 'migration_note' | ...
     migration_id  TEXT NOT NULL,
-    seq           INTEGER NOT NULL,       -- 每 migration_id 内从 1 起，连续 +1
-    prev_sha      TEXT NOT NULL,          -- 上一事件规范化 JSON 的 sha256；首事件为 GENESIS
-    detail_json   TEXT NOT NULL,          -- 事件正文（含全部证据字段）
-    s5_failed_ever INTEGER NOT NULL CHECK (s5_failed_ever IN (0,1)),  -- 一等列，便于单调校验
-    ts            TEXT NOT NULL,          -- ISO-8601 UTC，毫秒
-    UNIQUE (migration_id, seq),           -- 数据库级唯一：并发下不可能出现重复 seq
-    UNIQUE (migration_id, prev_sha)       -- 同一迁移不允许两个事件共享前序（防分叉）
+    old_phase     TEXT NOT NULL,
+    new_phase     TEXT NOT NULL,
+    reason        TEXT,
+    ts            TEXT NOT NULL
 );
 ```
 
+**为什么无需可空列**：`migration_tx_notes` 根本没有 `seq/prev_sha/token_fp/s5_failed_ever` 列，因此不存在"留 NULL""伪造序号""与 durable 链发生不明关系"的可能；β′ 只读 `system_events`，**永不读取** `migration_tx_notes`，不会把提示当成已持久化证明。
+
+**统一入口 `emit_event()`：一个入口，两个后端**
+
+| 后端 | 连接 | 事务边界 | 落表 | 失败语义 | 是否进入证据链 |
+| --- | --- | --- | --- | --- | --- |
+| `tx_local` | `rec.conn`（迁移原连接） | 迁移事务内 | `migration_tx_notes` | 写失败只记日志；**phase 仍推进**（非权威） | **否** |
+| `durable` | `audit_conn()`（独立审计连接） | 独立事务 `BEGIN IMMEDIATE … COMMIT` | `system_events` | 写失败 → 返回 `False`，**phase 不推进** | **是** |
+
 **字段来源（不接受调用方随意传入）**
 
-| 字段 | 唯一合法来源 | 伪造防护 |
-| --- | --- | --- |
-| `migration_id` | 迁移上下文常量 `MID` | 与凭据行、`token_fp` 同源 |
-| `old_phase` / `new_phase` | `rec.phase` 与转换表（§1.2） | 不在表内即 `IllegalTransition` |
-| `k1_proof` | **§3.1 判定结果**经 `k1_proof_from_state()` 转换出的四个布尔 + `evidence_ts`（取 S4 结束时刻） | `set_phase` **不接受** `k1_proof` 参数；只能读 `rec.k1_state`，调用方无法伪造 |
-| `s5_result` | 本次 S5 实际结果（`ok` / `failed`；T6 禁止 `not_run`） | 取 `rec.s5_result`，由 S5 执行处唯一写入 |
-| `s5_failed_ever` | `rec.s5_failed_ever OR (s5_result == "failed")` | 历史值只能来自已持久化事件流（β′ 恢复或本进程上次成功写入） |
-| `seq` | `last.seq + 1`（首事件为 1） | 由写入事务内读取，不由调用方传入；`UNIQUE(migration_id, seq)` 兜底 |
-| `prev_sha` | 首事件 `GENESIS(mid)`；其余 `sha256_hex(canon(上一事件))` | 写入事务内读取上一事件，逐条校验 |
-| `ts` / `token_fp` | 当前 UTC 毫秒时间戳 / 当前 token 指纹（不含明文） | `token_fp` 与凭据行比对 |
+| 字段 | 唯一合法来源（durable） | 伪造防护 | tx_local 是否携带 |
+| --- | --- | --- | --- |
+| `migration_id` | 迁移上下文常量 `MID` | 与凭据行同源 | 携带（普通列） |
+| `old_phase` / `new_phase` | `rec.phase` 与转换表（§1.2） | 不在表内即 `IllegalTransition` | 携带 |
+| `k1_proof` | `k1_proof_from_state(rec.k1_state)`（§3.1 判定结果 + `evidence_ts` = S4 结束时刻） | `set_phase` / `emit_event` **不接受**该参数 | 不携带（tx_local 无证据语义） |
+| `s5_result` | `rec.s5_result`，S5 执行处唯一写入；T6 禁止 `not_run` | 不接受外部传入 | 不携带 |
+| `token_fp` | **凭据行指纹**：迁移开始时由 `token_fp_from_credential(token_row)` 计算一次（`sha256_hex(token_bytes)` 的 64 位小写 hex）存入只读的 `rec.token_fp` | `set_phase` / `emit_event` 不接受 `token_fp` 参数；写入前校验 `^[0-9a-f]{64}$` 且等于 `rec.token_fp` | 不携带 |
+| `s5_failed_ever` | `历史(链上最后一条列值) OR (s5_result=="failed")` | 历史值只来自已落库链 | 不携带 |
+| `seq` | `last.seq + 1`（首事件 1） | 由写事务内生成，调用方不得传入；`UNIQUE(migration_id,seq)` 兜底 | 不携带（无链） |
+| `prev_sha` | 首事件 `GENESIS(mid)`；其余 `sha256_hex(canon(上一事件行))` | 写事务内由已验证链计算 | 不携带 |
+| `ts` | 当前 UTC 毫秒 | — | 携带 |
 
-**规范化与哈希规则（唯一口径，禁止各写各的）**
+**`token_fp` 的完整实现链（P0-1）**
 
-1. 规范化 JSON：`json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)`
-2. 编码：UTF-8（无 BOM）
-3. 布尔小写 `true/false`，`null` 保留，整数不写成浮点，时间统一 `YYYY-MM-DDTHH:MM:SS.sssZ`
-4. 参与哈希的字段集合固定为 `{event, migration_id, seq, prev_sha, detail, ts}`，其中 `detail` 为事件正文对象（含全部证据字段）；**任何字段增删都必须同时改版本号 `schema_version`，旧事件不重算**
-5. `sha256_hex(x) = hashlib.sha256(x.encode("utf-8")).hexdigest()`；`GENESIS(mid) = sha256_hex("GENESIS:" + mid)`
-6. `seq` 起始值 1，跨重启不重置（β / β′ 读到 `last.seq` 继续 +1）；不得跳号、不得复用、不得回填
+1. **唯一可信来源**：迁移凭据行。`rec.token_fp = token_fp_from_credential(token_row)`，在 T2 之后、S1 之前计算一次，此后只读；
+2. **写入路径**：`set_phase` → `emit_event(event, detail)` → durable 后端 `write_event()` 从 `rec.token_fp` 取值，**作为独立列** `token_fp` 与 `detail_json` 同一条 `INSERT` 落库（`detail_json` 内**不重复**该字段，全篇唯一口径 = 独立列）；
+3. **写入前校验**：格式（64 位小写 hex）+ 与 `rec.token_fp` 相等 + 与凭据行当前值相等；任一不符 → `required_evidence_missing()` 返回 `"token_fp"`，T6 拒写，`set_phase` 返回 `False`；
+4. **β′ 读取路径**：`SELECT token_fp FROM system_events WHERE migration_id=?` 取 T6 行（`E1` 定位的那一条）的**真实列值**，与当前凭据行重算值比对；缺失 / 非 64 hex / 不一致 → E2 失败 → 禁 T7/T8；
+5. **不得降级**：`token_fp` 为空字符串、`NULL`、`"unknown"` 之类占位值一律视为缺失（DDL 的 `NOT NULL CHECK(length=64)` 与写入前校验双保险）。
 
-**写入原子性（依赖既有机制，不新增组件）**
+**规范化与哈希规则（唯一口径）**
 
-- 依赖一：**迁移单实例锁**（迁移期间持有的进程级/文件级互斥），保证同一时刻只有一个迁移写者；
-- 依赖二：**SQLite 单写者 + `BEGIN IMMEDIATE`**：写入事务边界为
-  `BEGIN IMMEDIATE` → 读 `last(seq, prev_sha, s5_failed_ever)` → 校验单调性 → 构造 payload → `INSERT` → `COMMIT`；
-- `BEGIN IMMEDIATE` 在事务开始即取写锁，两个写者不可能同时进入该段；`UNIQUE(migration_id, seq)` 与 `UNIQUE(migration_id, prev_sha)` 是第二道防线（违反即 `IntegrityError` → 按写失败处理，不重试）；
-- 事务外不做任何"先占 seq"的动作；`busy_timeout ≤ 500ms`、单次尝试（§1.3 规则 4）；
-- 失败语义：`INSERT`/`COMMIT` 任一失败 → 事件未落 → **不推进 phase**、**不把新 `s5_failed_ever` 提交到内存**（内存值只在 `COMMIT` 成功后赋给 `rec`）、不重试、不补写。
+1. 规范化 JSON：`json.dumps(obj, sort_keys=True, separators=(",",":"), ensure_ascii=False)`
+2. 编码：UTF-8（无 BOM）；布尔小写；`null` 保留；整数不写成浮点；时间 `YYYY-MM-DDTHH:MM:SS.sssZ`
+3. **参与哈希的字段集合（durable）**：`{event, migration_id, seq, prev_sha, token_fp, s5_failed_ever, detail, ts}`——即事件行的"可重建视图"，`id` 与自增顺序不参与
+4. 增删字段必须同时改 `schema_version` 并重新定义哈希集；**旧事件不重算、不改写**
+5. `sha256_hex(x)=hashlib.sha256(x.encode("utf-8")).hexdigest()`；`GENESIS(mid)=sha256_hex("GENESIS:"+mid)`
+6. `seq` 从 1 起、连续 +1、跨重启不重置、不跳号、不复用、不回填
+
+**`write_event()`：完整证据链验证 + 追加，全部在同一写事务内（P0-3）**
 
 ```python
-# 伪代码：唯一事件写入入口
+# 伪代码：唯一 durable 写入权威入口
 def write_event(rec, event, detail):
-    """所有 migration_phase / migration_note 的唯一落库通道。"""
-    canon_detail = detail                                  # 已按上述规范化规则构造
-    conn = audit_conn()                                    # 独立审计连接（非迁移原连接）
-    conn.execute("BEGIN IMMEDIATE")                        # 写锁在事务开始即取得
+    conn = audit_conn()
+    conn.execute("BEGIN IMMEDIATE")            # 写锁在事务开始即取得
     try:
-        last = conn.execute(
-            "SELECT seq, prev_sha, s5_failed_ever FROM system_events "
-            "WHERE migration_id=? ORDER BY seq DESC LIMIT 1", (MID,)).fetchone()
-        hist_failed = bool(last.s5_failed_ever) if last else False   # 一等列，单调不减
-        new_failed   = hist_failed or (rec.s5_result == "failed")
+        rows = conn.execute(
+            "SELECT event,migration_id,seq,prev_sha,token_fp,s5_failed_ever,detail_json,ts "
+            "FROM system_events WHERE migration_id=? ORDER BY seq ASC", (MID,)).fetchall()
+        verify_full_chain(rows, MID)           # ← 全链校验，缺一即失败（见下）
+        last = rows[-1] if rows else None
+        hist_failed = bool(last.s5_failed_ever) if last else False
+        new_failed  = hist_failed or (rec.s5_result == "failed")
         if hist_failed and not new_failed:
-            raise EvidenceMonotonicityViolation(MID)        # 不允许 true → false
+            raise EvidenceMonotonicityViolation(MID)
         seq      = (last.seq + 1) if last else 1
-        prev_sha = sha256_hex(canon(load_event_by_seq(MID, last.seq))) if last else GENESIS(MID)
-        # prev_sha 由上一事件实际内容算出，写入后可与"下一事件的 prev_sha"逐条对齐（§1.4 E2）
-        detail["s5_failed_ever"] = new_failed
-        row = dict(event=event, migration_id=MID, seq=seq, prev_sha=prev_sha,
-                   detail=detail, ts=now_iso())
-        conn.execute("INSERT INTO system_events(event,migration_id,seq,prev_sha,detail_json,"
-                     "s5_failed_ever,ts) VALUES (?,?,?,?,?,?,?)",
-                     (event, MID, seq, prev_sha, canon(row["detail"]), int(new_failed), row["ts"]))
+        prev_sha = sha256_hex(canon_event_row(last)) if last else GENESIS(MID)
+        tfp      = rec.token_fp
+        if not re.fullmatch(r"[0-9a-f]{64}", tfp or "") or tfp != credential_token_fp(MID):
+            raise EvidenceIntegrityError("token_fp")
+        detail = dict(detail, schema_version=EVIDENCE_SCHEMA_VERSION)
+        conn.execute("INSERT INTO system_events(event,migration_id,seq,prev_sha,token_fp,"
+                     "s5_failed_ever,detail_json,ts) VALUES (?,?,?,?,?,?,?,?)",
+                     (event, MID, seq, prev_sha, tfp, int(new_failed), canon(detail), now_iso()))
         conn.execute("COMMIT")
-        rec.s5_failed_ever = new_failed                     # 只在 COMMIT 成功后提交内存
+        rec.s5_failed_ever = new_failed        # 只在 COMMIT 成功后提交内存
         return True
     except EvidenceMonotonicityViolation:
-        conn.execute("ROLLBACK"); raise
-    except Exception as e:
-        conn.execute("ROLLBACK")
-        non_db_log("event_write_failed", e)                 # 不重试、不补写
+        safe_rollback(conn); raise
+    except EvidenceChainBroken as e:
+        safe_rollback(conn)
+        non_db_log("evidence_chain_broken", e)  # 不重建、不补写、不覆盖、不删历史
         return False
+    except Exception as e:
+        safe_rollback(conn); non_db_log("event_write_failed", e); return False
 ```
 
+`verify_full_chain(rows, mid)` 的判定项（**在同一次 `BEGIN IMMEDIATE` 事务内**，任一不过即 `EvidenceChainBroken`）：
+
+| # | 校验 | 说明 |
+| --- | --- | --- |
+| C1 | `rows` 非空时首行 `seq == 1` | 起点唯一 |
+| C2 | 首行 `prev_sha == GENESIS(mid)` | 链锚点 |
+| C3 | 相邻行 `seq` 严格 +1，无跳号、无重复 | 连续性 |
+| C4 | 每行 `prev_sha == sha256_hex(canon_event_row(前一行))` | 逐条链式对齐（**不只验最后一条**） |
+| C5 | 每行 `detail_json` 重新规范化后与库内字节完全一致（`canon(json.loads(detail_json)) == detail_json`） | 防"正文被改但哈希未变" |
+| C6 | `token_fp` 逐行满足 `^[0-9a-f]{64}$` | 格式一致 |
+| C7 | `s5_failed_ever` 逐行单调不减（`row[i] >= row[i-1]`） | 历史失败不可清除 |
+| C8 | 每行 `migration_id == mid`（由查询条件保证，另做断言） | 防跨迁移串链 |
+
+**不得只验尾**：`write_event` 不提供"只读最后一条"的快速路径；任何"看起来连续"的尾行都要以 C1–C8 全链复核为前提。
+
+**`emit_event()` 与 `set_phase()`**
+
 ```python
-# 伪代码：set_phase 只负责"构造证据 + 调唯一入口 + 提交内存"
+# 伪代码：统一入口（按 DURABILITY 分派后端）
+def emit_event(rec, event, detail):
+    if DURABILITY_OF[event] == "tx_local":
+        return write_tx_event(rec, event, detail)     # 迁移事务内，落 migration_tx_notes
+    return write_event(rec, event, detail)            # 独立事务，落 system_events（含全链校验）
+
+def write_tx_event(rec, event, detail):
+    try:
+        rec.conn.execute(
+            "INSERT INTO migration_tx_notes(migration_id,old_phase,new_phase,reason,ts) "
+            "VALUES (?,?,?,?,?)",
+            (MID, rec.phase.name, detail.get("new_phase"), detail.get("reason"), now_iso()))
+    except Exception as e:
+        non_db_log("tx_local_note_failed", e)          # 非权威，失败仅日志
+    return True                                        # phase 仍推进（见语义对照）
+
 def set_phase(rec, new, reason):
     old = rec.phase
-    if (old, new) not in LEGAL_TRANSITIONS:               # 见 §1.2 表
+    if (old, new) not in LEGAL_TRANSITIONS:
         raise IllegalTransition(old, new)
-    durability = DURABILITY[(old, new)]                    # tx_local | durable
+    mode = DURABILITY[(old, new)]
 
-    if durability == "tx_local":
-        try:
-            rec.conn.execute("INSERT INTO system_events(event,detail_json,ts) VALUES ('migration_phase',?,?)",
-                             (canon(dict(migration_id=MID, old_phase=old.name, new_phase=new.name,
-                                         reason=reason, ts=now_iso())), now_iso()))
-        except Exception as e:
-            non_db_log("phase_event_tx_local_failed", e)    # 非权威，失败仅日志
+    if mode == "tx_local":                             # T1/T2：随迁移事务，非权威
+        write_tx_event(rec, "migration_phase",
+                       dict(old_phase=old.name, new_phase=new.name, reason=reason))
         rec.phase = new
         return True
 
-    # durable：构造证据 → 校验 → （仅 T6 需 k1_proof）
-    detail = dict(old_phase=old.name, new_phase=new.name, reason=reason,
-                  schema_version=EVIDENCE_SCHEMA_VERSION)
-    if (old, new) == (Phase.COMMIT_ATTEMPTED, Phase.UNKNOWN):      # T6
-        detail["k1_proof"] = k1_proof_from_state(rec.k1_state)     # 只读判定结果，不接受入参
-        detail["s5_result"] = rec.s5_result                        # 本次实际结果，禁止 not_run
-        missing = required_evidence_missing(detail)                # §1.4 必填字段
+    detail = dict(old_phase=old.name, new_phase=new.name, reason=reason)
+    if (old, new) == (Phase.COMMIT_ATTEMPTED, Phase.UNKNOWN):        # T6：证据必须齐
+        detail["k1_proof"] = k1_proof_from_state(rec.k1_state)       # 只读判定结果
+        detail["s5_result"] = rec.s5_result                          # 本次实际结果
+        missing = required_evidence_missing(rec, detail)             # §1.4 字段 + token_fp 格式/一致性
         if missing or not all_true(detail["k1_proof"]):
-            non_db_log("t6_evidence_incomplete", missing)          # 不写 T6
-            return False                                           # 内存仍 COMMIT_ATTEMPTED
-    ok = write_event(rec, "migration_phase", detail)               # 统一入口（含单调性/链校验）
+            non_db_log("t6_evidence_incomplete", missing); return False
+    ok = write_event(rec, "migration_phase", detail)
     if not ok:
-        return False                                               # 状态不推进
+        return False                                                 # 状态不推进
     rec.phase = new
     return True
 ```
 
+**`required_evidence_missing(rec, detail)`（T6 专用，返回缺失/不合格项名或 `None`）**
+
+依次检查：`migration_id`、`old_phase=COMMIT_ATTEMPTED`、`new_phase=UNKNOWN`、`k1_proof` 四布尔全 true 且含 `evidence_ts`、`s5_result ∈ {ok, failed}`（`not_run` 视为缺失）、`token_fp` 存在且 `^[0-9a-f]{64}$` 且等于 `credential_token_fp(MID)`、`rec.s5_failed_ever` 与 `rec.s5_result` 一致（`failed ⇒ True`）。任一不过 → T6 不写、`set_phase` 返回 `False`（MC43）。
+
+**写入结果不确定时的处理（P0-3 第 10 条）**
+
+`COMMIT`/`ROLLBACK`/`close` 抛错时，**不得假设"事件一定没落库"**，也不得盲目重试：
+
+| 情形 | 处理 |
+| --- | --- |
+| `INSERT`/`COMMIT` 抛错 | 新连接只读重查链：若目标 `seq` 行已存在且全链校验通过 → 视为已写入，采纳该事件（推进 phase）；若不存在 → 视为失败（不推进）；重查失败（库不可读/被锁）→ `UNKNOWN` 保守路径，不第二次写入 |
+| `ROLLBACK` 抛错 | 事务可能已自动回滚，也可能仍挂起；不得据此判断写入结果；以重查为准；重查失败 → maintenance + 文件日志 |
+| `close` 抛错 | 与事件写入无关，但会让"链是否完整"无法确认；按 §3.1/§3.3 处理，且不重试写入 |
+| 任何"不确定"状态 | **禁止重发**同一逻辑事件（否则重复 seq/分叉链）；只允许重查或停在 maintenance 等人工 |
+
 **语义对照**
 
-| 类型 | 事件失败时 | 内存 phase | 可否对外作为"已确认状态" |
-| --- | --- | --- | --- |
-| `tx_local` | 记日志 | **已改为新值** | **不可**（事件在事务内，可能随回滚消失；只作运行期提示） |
-| `durable` | 返回 `False`，**不改** | 仍为旧值 | 旧值仍是唯一确认状态 |
-| `durable` 且证据不全（仅 T6） | 返回 `False`，**不写事件** | 仍 `COMMIT_ATTEMPTED` | 旧值仍是唯一确认状态；按 T6′ 处理 |
+| 类型 | 落表 | 事件失败时 | 内存 phase | 可否对外作为"已确认状态" |
+| --- | --- | --- | --- | --- |
+| `tx_local` | `migration_tx_notes` | 记日志 | **已改为新值** | **不可**（随迁移事务回滚消失；不进证据链，β′ 不读） |
+| `durable` | `system_events` | 返回 `False`，**不改** | 仍为旧值 | 旧值仍是唯一确认状态 |
+| `durable` 且 T6 证据不全 / `token_fp` 不合格 | `system_events`（无写入） | 返回 `False`，**不写事件** | 仍 `COMMIT_ATTEMPTED` | 旧值仍是唯一确认状态；按 T6′ 处理 |
+| `durable` 且链损坏（C1–C8 任一失败） | `system_events`（无写入） | 返回 `False`，**不补写** | 不推进 | 只写 `migration-fault.log`；maintenance |
 
-### 2.2 `COMMITTED` 的四条件门禁
+### 2.2 `COMMITTED` 的五条件门禁（含历史失败门禁）
 
-进入阶段 C 前必须**同时**满足（四条件对三条入口相同，只是转换编号、证据来源与失败去向不同）：
+进入阶段 C 前必须**同时**满足（条件集对三条入口相同，只是转换编号、证据来源与失败去向不同）：
 
-0. **入口证据成立**（仅 β′）：E1–E3 校验通过 ∧ `s5_failed` 由持久事件流恢复为 `False`（§1.4）；α 的 K1 证明来自本进程 §3.1 流程，β 的 `K1_β` 来自启动自证，均不需要重读历史事件；
+0. **入口证据成立**（仅 β′）：E1–E3 校验通过 ∧ `s5_failed` 由持久事件列恢复为 `False`（§1.4）；α 的 K1 证明来自本进程 §3.1 流程，β 的 `K1_β` 来自启动自证，均不需重读历史事件；
 1. token 已确认可见（新连接只读查询成功）；
 2. 终止证据成立：路径 α 用 `K1`（§3.1）；路径 β 用 `K1_β`（§1.2 路径表）；路径 β′ 用 **T6 事件内的 `k1_proof`**（§1.4，历史证明，不由当前 phase 推断）；
 3. `K2` 成立（§3.2，即 S5 成功）；
-4. 对应的 `durable` 状态转换事件写入成功——路径 α 是 `T7`（`UNKNOWN → COMMITTED`），路径 β 是 `T4`（`COMMIT_ATTEMPTED → COMMITTED`），`set_phase` 返回 `True` 且 `rec.phase == COMMITTED`。
+4. **历史 S5 失败门禁**：`rec.s5_failed_ever == False`（路径 α 用本进程值，β′ 用事件列恢复值）——为 `True` 时**永久禁止 T7**（T7′），后续 `probe_ok` 不得清除；
+5. 对应的 `durable` 状态转换事件写入成功——路径 α 是 `T7`（`UNKNOWN → COMMITTED`），路径 β 是 `T4`（`COMMIT_ATTEMPTED → COMMITTED`），`set_phase` 返回 `True` 且 `rec.phase == COMMITTED`。
 
-**转换编号由当前 phase 唯一决定**：当前 `COMMIT_ATTEMPTED` → `T4`；当前 `UNKNOWN` → `T7`。两者不可互换，也不得"为了套用某个编号"而先改 phase。
+**门禁必须在 `set_phase()` 之前执行**：历史失败是**业务状态禁止**，`write_event` 的单调性检查是**写入完整性约束**。前者不能靠后者的"拒写"实现（否则会出现"事件写不进去所以状态没变"的偶然正确），两者必须分别判定、分别测试（MC44/MC45/MC47）。
 
-**`evidence_ok` 的定义**（仅 β′ 需要）：§1.4 E1 ∧ E2 ∧ E3 全部通过，且由事件流恢复出 `s5_failed == False`；`evidence_ok` 为 `False` 时**不允许**进入 T7/T8 判定，只能停 `UNKNOWN`。
+**转换编号由当前 phase 唯一决定**：当前 `COMMIT_ATTEMPTED` → `T4`；当前 `UNKNOWN` → `T7`。不得互换，也不得"为了套用某个编号"而先改 phase。
+
+**`evidence_ok` 的定义**（仅 β′ 需要）：E1 ∧ E2 ∧ E3 全通过 ∧ `s5_failed == False`；为 `False` 时不得进入 T7/T8 判定。
 
 ```python
 # 伪代码
-gate = token_visible and k1_or_beta and k2
+token_gate = token_visible and k1_or_beta and k2          # ①–③
+hist_gate  = not rec.s5_failed_ever                        # ④ 历史失败门禁（α / β′ 共用）
+gate       = token_gate and hist_gate
 
 if rec.phase == Phase.COMMIT_ATTEMPTED:        # 只可能是路径 β
     if not (gate and set_phase(rec, Phase.COMMITTED, "recovery_gate_passed")):
         # T4′：不转换，不退化为 UNKNOWN（路径 β 没有 →UNKNOWN 这一步）
         append_reason(rec, "recovery_gate_failed", ...) if k1_beta else non_db_log(...)
-        handle_post_commit_failure(...)        # 阶段 C 不进入
+        handle_post_commit_failure(...)
     else:
         enter_phase_c(rec)
 
-elif rec.phase == Phase.UNKNOWN:               # 路径 α（或 β′）
+elif rec.phase == Phase.UNKNOWN:               # 路径 α 或 β′
     if is_beta_prime and not evidence_ok:      # E1–E3 未通过：不得判 T7/T8
-        append_reason(rec, "evidence_unverified", ...)   # 停留 UNKNOWN，不推进
+        append_reason(rec, "evidence_unverified", ...)
         handle_post_commit_failure(...)
-    elif not gate:
-        append_reason(rec, "unknown_gate_incomplete", ...)   # 停留 UNKNOWN（T7′）
+    elif not hist_gate:                        # ④ 历史曾失败 → T7′（永久）
+        append_reason(rec, "historical_s5_failure", ...)   # 只记原因，不转换
+        handle_post_commit_failure(...)
+    elif not token_gate:                       # ①–③ 不全 → 停留 UNKNOWN
+        append_reason(rec, "unknown_gate_incomplete", ...)
         handle_post_commit_failure(...)
     elif not set_phase(rec, Phase.COMMITTED, "token_visible_and_isolated"):
         append_reason(rec, "committed_event_failed", ...)     # 仍停留 UNKNOWN
@@ -439,6 +524,8 @@ elif rec.phase == Phase.UNKNOWN:               # 路径 α（或 β′）
     else:
         enter_phase_c(rec)                     # 唯一的阶段 C 入口
 ```
+
+**T8（`UNKNOWN → TX_ROLLED_BACK`）同样受 ④ 约束**：`hist_gate` 为 `False` 时一律走 T8′，即使 token 与迁移对象均不可见；判定顺序同样是"历史门禁 → 结论条件 → `set_phase`"。
 
 ### 2.3 补偿转换的合法性（明确定义）
 
@@ -450,6 +537,9 @@ elif rec.phase == Phase.UNKNOWN:               # 路径 α（或 β′）
 | `UNKNOWN → TX_ROLLED_BACK` 但 **S5 曾失败** | **不允许**（T8′） | 同源理由：看不到 token 也不能证明外部写者已消失 | 保持 `UNKNOWN`，继续保守恢复 |
 | β′ 的 T7/T8 但 **E1–E3 未通过** | **不允许** | 缺历史 K1 证明或 `s5_failed` 不可恢复时，任何结论都无依据 | 停 `UNKNOWN`；链完整时一条 `evidence_unverified`，链断裂时只写文件日志；不进阶段 C |
 | T6 证据构造失败后的"补写" | **不允许** | 不得只补部分字段、不得跳过校验、不得用 `migration_note` 冒充 T6 | 返回 `False`，停 `COMMIT_ATTEMPTED`，文件日志 |
+| `token_fp` 缺失 / 非 64 位 hex / 与凭据行不符 | **不允许**（DB 的 `CHECK(length=64)` + 写入前校验双保险） | 指纹是"迁移身份"的一部分，无法降级 | T6 拒写（`set_phase` 返回 `False`）；β′ E2 失败 |
+| 事件链 C1–C8 任一失败 | **不允许**追加 | 断链不可自动修复 | 不写事件、不推进 phase、maintenance、只写文件日志 |
+| 写入结果不确定（`COMMIT`/`ROLLBACK` 抛错） | **不允许重发**同一逻辑事件 | 重发会造成重复 `seq` / 分叉链 | 只读重查链，按是否存在判定；查不清则停 maintenance |
 | `COMMIT_ATTEMPTED → UNKNOWN` 但 **K1 不成立** | **不允许**（T6′） | 原连接终止未被证明，写库会撞锁并被误读 | **不转换**，phase 停留 `COMMIT_ATTEMPTED`；只写文件日志；maintenance |
 | 二次补偿也失败（T6 事件失败） | — | **不推进任何状态** | 保持 maintenance；非数据库日志；`handle_post_commit_failure`；非零退出；**绝不开放写入** |
 | `COMMITTED → UNKNOWN` | **不允许** | 一旦 COMMITTED 已确认，后续失败属阶段 C，由 `handle_post_commit_failure` 处理，phase 不再回退（事件记 `migration_rollback`） | — |
@@ -477,12 +567,16 @@ elif rec.phase == Phase.UNKNOWN:               # 路径 α（或 β′）
 | PH11 | 同 PH10 / PH10b | 检查写入入口与 success | 写入 503；`schema_migrations` 中该 mid 无 `success`；三重一致性断言全过（内存 phase、事件序列、`enter_phase_c` 次数三者一致） |
 | MC19 | COMMIT 抛异常，且 `rollback_for_migration()` 抛错（如 `SQLITE_BUSY`） | 注入回滚失败；统计 S4/S5 完成前的数据库写入 | S4（close）与 S5（探测）**完成之前**，`system_events` 写入次数 == **0**；回滚失败只出现在 `migration-fault.log`；`close()` 成功则 K1 成立 → S5 后可写 `→UNKNOWN`；`close()` 也失败则按 MC14 走 T6′（停 `COMMIT_ATTEMPTED`）；两种情形均无 success |
 | MC20 | `UNKNOWN` 态；K1 成立、S5 曾失败、新连接 token 可见（同一进程走后 T7 判定；另设 β′ 变体：重启后由事件流恢复 `s5_failed=True`） | 走 T7 判定 | **仍为 `UNKNOWN`**（T7′ 禁止）；不进入阶段 C；无 `→COMMITTED` 事件；无 success；保守恢复；写入关闭。β′ 变体结论相同，且必须先有 E1–E3 通过 |
-| MC38 | 路径 α，K1 成立、S5 失败（或成功），T6 写入 | **读 DB 实际行**（`SELECT event,migration_id,seq,prev_sha,detail_json,s5_failed_ever,ts`），逐字段校验 `migration_id`/`old_phase`/`new_phase`/`k1_proof`（四布尔+`evidence_ts`）/`s5_result`/`s5_failed_ever`/`seq`/`prev_sha`/`ts`/`token_fp`；随后**真实重启**，β′ 用同一套字段复核 | 字段齐全且自洽；`seq=1`、`prev_sha=GENESIS(mid)`；重启后 E1–E3 全过；`s5_result` 与历史标记一致 |
+| MC38 | 路径 α，K1 成立、S5 失败（或成功），T6 写入 | **读 DB 实际行**（`SELECT event,migration_id,seq,prev_sha,token_fp,s5_failed_ever,detail_json,ts`），逐字段校验 `migration_id`/`old_phase`/`new_phase`/`k1_proof`（四布尔+`evidence_ts`）/`s5_result`/`s5_failed_ever`/`seq`/`prev_sha`/`ts`，以及 **`token_fp` 独立列**（断言 `length=64`、小写 hex、等于凭据行重算值、`detail_json` 内**不含**该字段）；随后**真实重启**，β′ 用同一套字段复核 | 字段齐全且自洽；`seq=1`、`prev_sha=GENESIS(mid)`；`token_fp` 为真实列值且与凭据行一致；重启后 E1–E3 全过 |
 | MC39 | 任意后续转换（T7/T8/T4/T5）与 `migration_note` | 读 DB 实际行 | 每条都含 `migration_id`、`s5_failed_ever`、`seq`、`prev_sha`；`seq` 连续 +1 无跳号；每条 `prev_sha` == 上一事件规范化 JSON 的 sha256（逐条重算验证）；无一条缺少证据字段 |
 | MC40 | 已持久化 `s5_failed_ever=true` | 直接调 `write_event`/`append_reason` 要求写 `false` | 抛 `EvidenceMonotonicityViolation`；事务回滚；DB 无新行；`rec.s5_failed_ever` 仍 `true`；`phase` 不变；只落文件日志 |
 | MC41 | 两个写入者并发追加事件（线程/进程各一，均走统一入口） | 同时开始写 | 无重复 `seq`（`UNIQUE(migration_id,seq)` 兜底）、无分叉 `prev_sha`（`UNIQUE(migration_id,prev_sha)` 兜底）；失败方得到写失败、不重试、不推进 phase；成功方序严格连续；`s5_failed_ever` 不倒退 |
 | MC42 | 人为制造链断裂（删除中间事件 / 篡改 `prev_sha` / 改 `seq`）后追加 `migration_note(evidence_unverified)` | 观察 | **不写** DB note；不重建、不覆盖、不重算历史；只写 `migration-fault.log`；`phase` 不变；无 success |
-| MC43 | T6 证据构造失败（缺 `k1_proof` 字段 / 布尔不全 true / `s5_result=not_run` / `token_fp` 不符） | 调 `set_phase(COMMIT_ATTEMPTED→UNKNOWN)` | 返回 `False`；**DB 无 T6 行**；内存仍 `COMMIT_ATTEMPTED`；不开放写入；按 T6′ 走文件日志 + 保守恢复 |
+| MC43 | T6 证据构造失败（缺 `k1_proof` 字段 / 布尔不全 true / `s5_result=not_run` / `token_fp` 缺失 / `token_fp` 非 64 位 hex / `token_fp` 与凭据行不符，逐一构造） | 调 `set_phase(COMMIT_ATTEMPTED→UNKNOWN)` | 每种都返回 `False`；**DB 无 T6 行**（`SELECT count(*)` 为 0）；内存仍 `COMMIT_ATTEMPTED`；不开放写入；文件日志记录对应缺失项 |
+| MC44 | 路径 α：T6 时 S5 失败（`s5_failed_ever=true` 已落库），随后同一进程 S5 探测成功且 token 可见 | 走 §2.2 门禁 | `hist_gate=False` → **禁止 T7**；DB 无 `→COMMITTED` 行；一条 `historical_s5_failure` note（`s5_failed_ever` 仍为 1）；未进阶段 C；无 success |
+| MC45 | 路径 α：同上，但 token 与迁移对象均不可见 | 走 §2.2 门禁 | `hist_gate=False` → **禁止 T8**（T8′）；DB 无 `→TX_ROLLED_BACK` 行；`s5_failed_ever` 仍为 1；未进阶段 C；无 success |
+| MC46 | 路径 β′：真实重启，事件列恢复 `s5_failed_ever=1` | 分别构造 token 可见 / 均不可见 | 前者 T7 被禁止；后者 T8 被禁止；两者均停 `UNKNOWN`；无 success；maintenance 保持 |
+| MC47 | 已 `s5_failed_ever=1`；分别构造：① 合法 `probe_ok`（`s5_result="ok"`、`s5_failed_ever` 沿用 1）② 带清除语义的 `probe_ok`（`s5_failed_ever=false` / `clear=true`） | 走 `write_event` / `emit_event` | ① 正常写入（列值仍 1，历史不被清除）② 拒写（`EvidenceMonotonicityViolation`），**DB 实际查验**：无新行、`SELECT MAX(s5_failed_ever)` 仍为 1、已有行该字段仍 true；只落文件日志 |
 
 
 ---
@@ -749,7 +843,7 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | COMMIT_ATTEMPTED | （无转换） | β 门禁不满足（`K1_β` 假 / S5 失败 / 事件失败） | **β** | `migration_note`（仅 `K1_β` 真时） | — | 停 `COMMIT_ATTEMPTED`；保守恢复（T4′） |
 | COMMIT_ATTEMPTED | UNKNOWN | COMMIT 抛异常 ∧ **K1 成立**（S5 成功或失败均可）（T6） | **α** | durable | **S5 后（唯一）** | 事件失败 → 非 DB 日志 + 恢复 |
 | COMMIT_ATTEMPTED | （无转换） | COMMIT 抛异常 ∧ **K1 不成立**（S5 成功或失败均可）（T6′） | **α** | **无**（`migration-fault.log`） | — | phase 停留 `COMMIT_ATTEMPTED`；maintenance + 保守恢复 / 待人工 |
-| COMMIT_ATTEMPTED | （无转换） | T6 证据构造/校验失败（字段缺、`k1_proof` 不全 true、`s5_result=not_run`） | **α** | **无**（不得写不完整证据） | — | 停 `COMMIT_ATTEMPTED`；文件日志；保守恢复（T6′ 同口径） |
+| COMMIT_ATTEMPTED | （无转换） | T6 证据构造/校验失败（字段缺、`k1_proof` 不全 true、`s5_result=not_run`、**`token_fp` 缺失/非 64 hex/与凭据行不符**） | **α** | **无**（不得写不完整证据） | — | 停 `COMMIT_ATTEMPTED`；文件日志；保守恢复（T6′ 同口径） |
 | COMMIT_ATTEMPTED | （无转换） | T6 事件写入失败（`INSERT`/`COMMIT`/唯一约束冲突） | **α** | **无** | — | 停 `COMMIT_ATTEMPTED`；不重试、不补写；文件日志；保守恢复 |
 | UNKNOWN | COMMITTED | token 可见 **∧ K1 ∧ S5 成功 ∧ 事件成功**（四条件）（T7）；β′ 另需 E1–E3 ∧ `s5_failed=False` | **α / β′** | durable | 查询后（β′ 在 E1–E3 后） | 任一不满足 → 停留 UNKNOWN + 恢复 |
 | UNKNOWN | COMMITTED（S5 曾失败） | **禁止（T7′）** | **α / β′** | — | — | 保持 UNKNOWN；不写 success、不开写入 |
@@ -759,6 +853,8 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | UNKNOWN | （无转换） | β′ E1–E3 任一失败（证据缺失/不全/不符） | **β′** | `migration_note(evidence_unverified)` | E1–E3 后 | 停 `UNKNOWN`；不进阶段 C；无 success；写入关闭 |
 | COMMITTED | 任意 | — | 共用 | **禁止回退**（阶段 C 失败用 `migration_rollback` 事件） | — | — |
 
+> **`tx_local` 不进入证据链**：T1/T2 的 `migration_phase` 落在 `migration_tx_notes`（随迁移事务），本表只描述 `system_events` 中的 durable 转换；β′ 绝不读 `migration_tx_notes`。
+>
 > **β′ 的证据前置**：β′ 的 T7/T8 必须先通过 E1–E3（§1.4），`s5_failed` 只能由持久事件流恢复；`phase=UNKNOWN` 本身不构成任何证明。
 >
 > **路径不混用**：α 只出 `T6/T6′` 与 `T7/T7′/T8/T8′`；β 只出 `T4/T4′/T5`。表中「路径」列的 `α / β′` 表示两者共用同一转换定义（此时 phase 已是 `UNKNOWN`，终止证据按各自入口解释）。
@@ -850,7 +946,9 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | 不得依赖易失标记 | §3.2「不得依赖易失状态」行；文件日志仅辅助 |
 | T6 事件写不进去 | 仍按 §2.1/§2.4：不伪造 UNKNOWN、不开放写入 |
 | 不放宽既有条件 | K1/S5/T7/T8 五/四条条件原样保留，β′ 只增加前置校验 |
-| 测试 | MC34–MC37（真实进程重启） |
+| `token_fp` 真实持久化 | §2.1 独立列 `token_fp`（CHECK 64）+ 字段来源表 + `required_evidence_missing` |
+| `tx_local` 与 DDL 不冲突 | §2.1 `migration_tx_notes` 独立表；与 `system_events` 无共享列语义 |
+| 测试 | MC34–MC37（真实进程重启）、MC38（含 `token_fp` 列断言）、MC46 |
 
 ### 6.7 七次修订 证据写路径接入
 
@@ -865,6 +963,17 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | 单调性违反拒写 | `EvidenceMonotonicityViolation`（写入前 + 事务回滚） |
 | 链断裂不重建 | §1.4 三条 note 分支；§2.1「失败语义」 |
 | 测试 | MC38–MC43 |
+
+### 6.8 八次修订 证据完整性闭环（四项 P0）
+
+| 要求 | 落实 |
+| --- | --- |
+| P0-1 `token_fp` 写入与校验 | 唯一来源 = 凭据行（`token_fp_from_credential`）；独立列 + `CHECK(length=64)`；`set_phase`/`emit_event` 不收该参数；`write_event` 落同一条 `INSERT`；β′ 读**列值**比对；缺失/格式错/不符 → T6 拒写、β′ E2 失败 |
+| P0-2 `tx_local` 与 DDL 冲突 | 拆表：`migration_tx_notes`（tx_local，迁移事务内，无链列）+ `system_events`（durable，全 NOT NULL）；`emit_event` 一个入口两个后端；tx_local 不进链、β′ 不读、不占 `seq` |
+| P0-3 全链验证进事务 | `write_event` 内 `BEGIN IMMEDIATE` 后读全链并跑 C1–C8，通过才分配 `seq`/`prev_sha` 并 `INSERT`；`append_reason` 的事务外 `verify_chain` 降级为诊断；链损坏只写文件日志；写入结果不确定时只读重查、禁止重发 |
+| P0-4 α 也受历史失败门禁 | §2.2 `hist_gate = not rec.s5_failed_ever`，在 `set_phase` 之前判定；T7 与 T8 同受约束；`probe_ok` 不得清除；门禁与"写入拒写"分别定义、分别测试 |
+| 一致性检查 | §8 新增"DDL / INSERT / tx_local / token_fp / 全链 / 门禁"六项逐条复核 |
+| 测试 | MC44–MC47（读真实持久化行） |
 
 ---
 
@@ -882,7 +991,7 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | RC | 6 | 6 | — |
 | CF | 8 | 8 | — |
 | AU | 9 | 9 | — |
-| MC | 12 | **43** | +MC13–MC18；二次修订 +MC19–MC20；三次修订 +MC21、MC15b/15c/15d、MC13b；四次修订 +MC22–MC24；五次修订 +MC25/MC26/MC26b/MC27/MC27b；六次修订 +MC34–MC37；七次修订 +MC38–MC43 |
+| MC | 12 | **47** | +MC13–MC18；二次修订 +MC19–MC20；三次修订 +MC21、MC15b/15c/15d、MC13b；四次修订 +MC22–MC24；五次修订 +MC25/MC26/MC26b/MC27/MC27b；六次修订 +MC34–MC37；七次修订 +MC38–MC43；八次修订 +MC44–MC47 |
 | CR | 5 | 5 | — |
 | FX | 3 | **4** | +FX4 |
 | PH | 5 | **13** | +PH6–PH11、PH9b、PH10b |
@@ -914,8 +1023,8 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | durable 事件后于 S5 | §1.3 时序表 | §5 事件时点列 | MC13 |
 | 隔离失败不写 DB | 规则 1–2、5、7 | §1.3 硬规则 / §3.1 禁令表 | MC14/MC19 |
 | 事件失败不改内存 | `set_phase` 返回 False 分支 | §2.1 表 | PH9 |
-| COMMITTED 四条件 | §2.2 门禁 | §5 第一行 | PH9/PH10 |
-| 补偿合法性 | `to_unknown` | §2.3 表 | PH10/PH11 |
+| COMMITTED 五条件 | §2.2 门禁（含 `hist_gate`） | §5 `UNKNOWN→COMMITTED` 行 | PH9/PH10/MC44 |
+| 补偿合法性 | `to_unknown` | §2.3 表 | PH10/PH10b/PH11 |
 | K1 四条件 | §3.1 伪代码 | §3.1 判定表 | MC15 |
 | K1 不成立即不写库 | T6′ 分支（无 `set_phase`） | §5 `COMMIT_ATTEMPTED → （无转换）` 行 | MC14/MC15 |
 | quarantine 后仍能终止 | `rollback_for_migration()` 只放行 ROLLBACK | §3.1 通道表 | MC15b/MC15c/MC15d |
@@ -927,7 +1036,7 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | 证据随事件构造校验 | `set_phase` durable 分支构造 `k1_proof`/`s5_result` | §2.1 字段来源表 | MC38/MC43 |
 | 所有入口统一 | `append_reason` 调用 `write_event` | §1.2 强制约束表 | MC39 |
 | 哈希链原子性 | `BEGIN IMMEDIATE` + 两个 UNIQUE 约束 | §2.1 DDL / 原子性说明 | MC41 |
-| 链断裂不伪造 | `verify_chain` 失败即停 | §1.4 三分支 | MC42 |
+| 链断裂不伪造 | `write_event` 内 `verify_full_chain` 失败即停 | §1.4 三分支 / §2.1 C1–C8 | MC42 |
 | 隔离失败仍关闭且 K1=False | `quarantined_ok=False` → `k1=False` | §3.1 判定表 | MC23/MC24 |
 | 关闭接口唯一 | `conn_wrapper.close()` 内部调底层 | §3.1 对象关系表 | MC27 |
 | `is_closed` 不得伪造 | 底层成功才置 True | §3.1 契约表 | MC27 |
@@ -940,8 +1049,24 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | 首个 durable 事件按路径 | §1.3 硬规则 3 | §5 事件时点列 | MC25/MC26 |
 | 隔离期禁写库 | §3.1 `non_db_log` 分支 | §3.1 禁令表 / §1.3 硬规则 1–2 | MC19 |
 | T7 四条件 | §1.2 T7 | §5 `UNKNOWN→COMMITTED` 行 | MC20 |
-| T7′ 禁止分支 | 判定处显式 `if s5_failed: stay UNKNOWN` | §1.2 T7′ / §2.3 | MC20 |
+| T7′ 禁止分支 | `hist_gate` 前置判定（α 与 β′ 共用） | §1.2 T7′ / §2.3 | MC20/MC44/MC46 |
+| T8′ 禁止分支（历史门禁） | 同 `hist_gate`，在 `set_phase` 前 | §1.2 T8′ / §2.3 | MC21/MC45/MC46 |
+| `token_fp` 真实落库 | `write_event` 的 `INSERT` 含 `token_fp` 列 | §2.1 DDL / 字段来源表 | MC38/MC43 |
+| `tx_local` 无 DDL 冲突 | `write_tx_event` 写 `migration_tx_notes`（无链列） | §2.1 两表说明 / 语义对照 | MC39（并集校验）/PH7 |
+| 全链验证在写事务内 | `verify_full_chain(rows)` 位于 `BEGIN IMMEDIATE` 之后 | §2.1 C1–C8 表 | MC41/MC42 |
+| 写入结果不确定不重发 | 只读重查 + 不重试 | §2.1 不确定处理表 | MC41 |
 | 独立夹具 | §4.2 | — | FX4/R10-A0/A1/A2 |
+
+**八次修订的六项全篇核对（本轮必须逐条过）**
+
+| # | 核对项 | 结论 |
+| --- | --- | --- |
+| 1 | DDL 与所有 `INSERT` 字段完全匹配 | `system_events` 8 列 ↔ `write_event` 的 `INSERT` 8 值；`migration_tx_notes` 5 列 ↔ `write_tx_event` 5 值；无表外写入点 |
+| 2 | `tx_local` 与 durable 事务边界无冲突 | tx_local 用 `rec.conn`（迁移事务内），durable 用 `audit_conn()`（独立 `BEGIN IMMEDIATE`）；不同表、不同连接 |
+| 3 | 所有 durable 事件经统一机制 | T4/T5/T6/T7/T8 与 `migration_note` 均调 `write_event`；T6 走 `set_phase` 的 durable 分支 |
+| 4 | T6 的 `token_fp` 真正持久化 | 独立列 + `CHECK(length=64)` + 写入前三重校验（格式/内存值/凭据行） |
+| 5 | β′ 从真实记录恢复 `token_fp` | `SELECT token_fp` 取列值比对（E2），不从 `detail_json` 猜、不从 phase 推 |
+| 6 | 历史门禁对 α、β′ 均有效 | `hist_gate = not rec.s5_failed_ever`，两条入口共用，且在 `set_phase` 之前 |
 
 **逐条结论**：伪代码中的每个 `set_phase` 调用都能在 §5 找到唯一一行；§5 每行至少一条测试；未出现"状态表有转换但代码无调用"（`UNKNOWN→COMMITTED`、`UNKNOWN→TX_ROLLED_BACK` 为兜底，代码中有对应分支但正常路径不触发，已注明）；也未出现"代码有转换但状态表未定义"。
 
@@ -989,7 +1114,11 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | 19 | S5 失败历史随进程消失 → 重启后误转 COMMITTED/ROLLED_BACK | `s5_failed_ever` 单调持久化，跨重启恢复；成功不得清除 | MC34/MC37 |
 | 20 | 证据字段只写在文档、写入路径遗漏 → T6 落库无证明 | §2.1 统一 `write_event` + 字段来源表 + `required_evidence_missing` | MC38/MC43 |
 | 21 | 并发追加导致重复 `seq` / 分叉 `prev_sha` / 单调倒退 | `BEGIN IMMEDIATE` + `UNIQUE(migration_id,seq)` + `UNIQUE(migration_id,prev_sha)` | MC40/MC41 |
+| 22 | `token_fp` 只在文档里要求、写入路径未落库 → β′ 无据可比 | 独立列 + CHECK + 写入前三重校验 + β′ 读列值 | MC38/MC43/MC46 |
+| 23 | `tx_local` 用与 DDL 冲突的 INSERT → 迁移期状态提示写不进去 | 拆表 `migration_tx_notes`；`emit_event` 双后端 | MC39/PH7 |
+| 24 | 只验尾行 → 中间被篡改仍记为"链连续" | `verify_full_chain` C1–C8 全链校验（事务内） | MC41/MC42 |
+| 25 | 路径 α 凭"后续 S5 成功"进入 T7，绕过历史失败 | `hist_gate` 前置门禁（α/β′ 共用） | MC44/MC45/MC46 |
 
 ---
 
-**v1.10 到此结束。** 七次修订合计**未编写代码、未执行迁移、未修改数据库、未修改生产配置或生产数据**；七次修订累计只处理"五项 + 两项 + 三项 + S2 异常保护 + 路径与关闭接口一致性 + β′ 跨重启证据 + 证据写入路径"的状态机与伪代码矛盾。**C11–C20 全部未确认，C12 仍未被本轮视为已批准。** 文档交回总体设计最终审查；未获批准前不提交 P-1 实施计划、不进入任何实施阶段。
+**v1.10 到此结束。** 八次修订合计**未编写代码、未执行迁移、未修改数据库、未修改生产配置或生产数据**；八次修订累计只处理"五项 + 两项 + 三项 + S2 异常保护 + 路径与关闭接口一致性 + β′ 跨重启证据 + 证据写入路径 + 证据完整性"的状态机与伪代码矛盾。**C11–C20 全部未确认，C12 仍未被本轮视为已批准。** 文档交回总体设计最终审查；未获批准前不提交 P-1 实施计划、不进入任何实施阶段。
