@@ -280,3 +280,35 @@ cd /tmp && curl -fsSLO https://raw.githubusercontent.com/laoXuHome/laoXuHome/mai
 前提：宿主机有 docker、当前用户可 `docker ps`/`docker exec`（root 或 docker 组）；nodepool 容器 running；`DATA_DIR/CONFIG_DIR/LOG_DIR/BACKUP_DIR/SUB_DIR` 五个目录都在（缺失会直接停，不会替你创建）。
 
 预期：`EXIT=0` 且日志含 `pre_import_dirs OK`、`container_*`/`host_*`、`digests_for_repo`、`integrity ok`、`P-7 状态：未执行（等待批准）`；若 `EXIT=2` 看 `STOP:` 那一行为何停止；`EXIT=3` 只会在你批准 P-7 后出现。
+
+
+---
+
+## 附录 D：r4 路径一致性核对补全（LOG_DIR / SUB_DIR）
+
+**问题**：r3 的导入前后比对只覆盖 `DATA_DIR / DB_PATH / BACKUP_DIR / CONFIG_DIR / STATE_DIR`，漏了会被 `config` 导入自动 mkdir 的 `LOG_DIR` 与 `SUB_DIR`，与"逐项比对"的描述不符。
+
+**修正**：
+
+1. 导入块补 `sub_dir`（`c.SUB_DIR`），`log_dir` 取 `c.LOG_DIR`，两者与其余三个一起输出；
+2. 核对改为**五目录全查**：`DATA_DIR / CONFIG_DIR / LOG_DIR / BACKUP_DIR / SUB_DIR`，逐项打印 `path_check <名称> OK  <路径>`；
+3. 预检查路径严格按 `backend/config.py` 的实际规则算：`DATA_DIR=env NODEPOOL_DATA_DIR 或 ./data`；`CONFIG_DIR/LOG_DIR/BACKUP_DIR` 各自 `env` 或 `<DATA_DIR>/config|logs|backup`；`SUB_DIR=<DATA_DIR>/sub`（`config.py:12` 无 env 覆盖）；全部 `resolve()`；
+4. 任一目录的预检查值与导入值不等 ⇒ `die`（`exit 2`），不继续；
+5. 导入值为空（取不到实际路径） ⇒ `die`，不允许跳过核对。
+
+**验收测试（沙箱）**
+
+| 用例 | 期望 | 实测 |
+| --- | --- | --- |
+| 五目录全部一致 | 通过 | `path_check` ×5 全 OK，`exit=0` |
+| `NODEPOOL_LOG_DIR` 指向另一已存在目录 | 两侧同规则 ⇒ 通过、不误停 | `path_check LOG_DIR OK /tmp/p1h3/logs_alt` |
+| `NODEPOOL_LOG_DIR` 指向不存在目录 | 导入前停止、不创建 | `STOP: 存在会被 backend.config 导入自动 mkdir 的目录（"LOG_DIR"）`；事后该目录仍不存在 |
+| LOG_DIR 预检查值漂移（注入） | 停止 | `STOP: 路径不一致：LOG_DIR 预检查=/a/logs_wrong 导入=/a/logs`，`rc=2` |
+| SUB_DIR 预检查值漂移（注入） | 停止 | `STOP: 路径不一致：SUB_DIR 预检查=/a/sub-wrong 导入=/a/sub`，`rc=2` |
+| 导入值 LOG_DIR / SUB_DIR 为空 | 停止、不跳过 | `STOP: 无法取得导入后的实际 LOG_DIR/SUB_DIR`，`rc=2` |
+| 全流程跑完后主库 | 不变 | `sha256` 前后一致（`5082449f…`），size/mtime 不变 |
+| P-7 未批准 | 完全跳过 | `SKIPPED: 未执行（等待批准）`，`state/` 仍只有哨兵文件 |
+
+> 漂移用例为**注入式**：脚本两侧读取同一份容器环境，自然状态下不会漂移；注入用于证明"一旦预检查与导入值分歧，一定停"。真实漂移只会来自 `config.py` 规则变更或环境变量被半途改动。
+
+**仍未执行**：生产探针、生产 P-7、迁移、恢复。命令与前提同附录 C。
