@@ -115,7 +115,7 @@ from pathlib import Path
 import backend.config as c
 d={'app_version':c.VERSION,'data_dir':str(c.DATA_DIR),'config_dir':str(c.CONFIG_DIR),
    'db_path':str(c.DB_PATH),'backup_dir':str(c.BACKUP_DIR),'log_dir':str(c.LOG_DIR),
-   'state_dir_env':os.getenv('NODEPOOL_STATE_DIR','')}
+   'sub_dir':str(c.SUB_DIR),'state_dir_env':os.getenv('NODEPOOL_STATE_DIR','')}
 d['state_dir']=d['state_dir_env'] or str(Path(d['data_dir'])/'state')
 print('PATHS_JSON '+json.dumps(d))
 " 2>&1) || true
@@ -127,16 +127,27 @@ if [ -z "$PJ" ]; then die "容器内 import backend.config 失败：拿不到权
 getjson() { printf '%s' "$PJ" | sed -n "s/.*\"$1\": \"\([^\"]*\)\".*/\1/p"; }
 CFG=$(getjson config_dir); CDATA=$(getjson data_dir); CDB=$(getjson db_path)
 CBK=$(getjson backup_dir); CST=$(getjson state_dir); AVER=$(getjson app_version)
-SENV=$(getjson state_dir_env)
+CLOG=$(getjson log_dir); CSUB=$(getjson sub_dir); SENV=$(getjson state_dir_env)
 [ -n "$CDB" ] && [ -n "$CBK" ] && [ -n "$CST" ] && [ -n "$CDATA" ] || die "关键路径解析不完整（db='$CDB' backup='$CBK' state='$CST' data='$CDATA'）"
 
-# 2.3 导入值 vs 预检查值 一致性
+# 2.3 导入值 vs 预检查值：五个会被 config 自动 mkdir 的目录逐个核对，缺一即停
 PRE_JSON=$(printf '%s' "$PREJ")
-for pair in "DATA_DIR:$CDATA" "DB_PATH:$CDB" "BACKUP_DIR:$CBK" "CONFIG_DIR:$CFG" "STATE_DIR:$CST"; do
-  k=${pair%%:*}; v=${pair#*:}
+for k in DATA_DIR CONFIG_DIR LOG_DIR BACKUP_DIR SUB_DIR; do
+  case "$k" in
+    DATA_DIR)   actual="$CDATA" ;;
+    CONFIG_DIR) actual="$CFG" ;;
+    LOG_DIR)    actual="$CLOG" ;;
+    BACKUP_DIR) actual="$CBK" ;;
+    SUB_DIR)    actual="$CSUB" ;;
+    *)          actual="" ;;
+  esac
+  [ -n "$actual" ] || die "无法取得导入后的实际 $k（值为空），按设计停止，不跳过核对"
   pv=$(printf '%s' "$PRE_JSON" | sed -n "s/.*\"$k\": \"\([^\"]*\)\".*/\1/p")
-  if [ -n "$pv" ] && [ "$pv" != "$v" ]; then die "路径不一致：$k 预检查=$pv 导入值=$v（配置与环境冲突，停止）"; fi
+  [ -n "$pv" ] || die "预检查结果缺少 $k，无法核对，按设计停止"
+  [ "$pv" = "$actual" ] || die "路径不一致：$k 预检查=$pv 导入=$actual（停止，不继续）"
+  say "path_check $k OK  $actual"
 done
+
 say "app_version       $AVER"
 say "container_data    $CDATA"
 say "container_db      $CDB"
