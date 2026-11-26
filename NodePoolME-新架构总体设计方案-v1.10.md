@@ -8,6 +8,7 @@
 **文档状态**：**待总体设计最终审查**（本文未自行认定通过；C11–C20 未确认）
 **二次修订（Final Two Fixes）**：① 隔离完成前禁止任何数据库事件写入（含 `append_reason`，改走 `migration-fault.log`）；② `UNKNOWN → COMMITTED` 收紧为四条件（token ∧ K1 ∧ S5 ∧ 事件成功），并新增 T7′ 禁止分支（S5 曾失败则永不转 COMMITTED）。改动点见 §0.1。
 **三次修订（Final Closure Fixes）**：① quarantine 后普通 SQL 全拒导致原 `ROLLBACK` 执行不到 → 新增 `rollback_for_migration()` 单点通道；② K1 统一为写库唯一闸门，K1 不成立一律不写事件、phase 停 `COMMIT_ATTEMPTED`；③ `UNKNOWN → TX_ROLLED_BACK` 收紧为五条件并新增 T8′。改动点见 §0.2。
+**四次修订（S2 异常保护）**：`in_transaction` 读取、`quarantine()`、回滚通道各自独立异常边界；`close()` 兜底必执行；隔离失败即 K1=False，严格按 T6′ 处理。改动点见 §0.3。
 
 ---
 
@@ -38,6 +39,14 @@
 | P0-1 quarantine 与 ROLLBACK 矛盾 | §3.1、§1.3 S2/S3、MC15b–15d | 先读 `in_transaction`（属性读）→ `quarantine` → `rollback_for_migration()`（只放行 `ROLLBACK`）→ `close()`；普通 `execute("ROLLBACK")` 仍被隔离拒绝 |
 | P0-2 统一 K1 规则 | §1.2（T6、新增 T6′）、§1.3 硬规则 7、§3.1 判定表、§3.2、§3.3、MC14/MC15 | K1 成立才可写事件（S5 成败不影响）；K1 不成立一律不写、不 `set_phase`，phase 停留 `COMMIT_ATTEMPTED` |
 | P0-3 收紧 T8 | §1.2（T8、新增 T8′）、§2.3、§5、§8、MC21 | `UNKNOWN → TX_ROLLED_BACK` 需五条件（token 不可见 ∧ 对象不可见 ∧ K1 ∧ S5 ∧ 事件成功）；S5 曾失败即永久 UNKNOWN |
+
+### 0.3 四次修订改动点（S2 异常保护）
+
+| 项 | 位置 | 改动 |
+| --- | --- | --- |
+| P0 S2 异常保护 | §3.1 异常边界表与伪代码、§1.3 S2–S4、MC22–MC24 | `in_transaction` 属性读、`quarantine()`、`rollback_for_migration()` 各自独立 `try`；`close()` 兜底必执行；`had_tx=UNKNOWN` 不参与 K1 |
+| K1 严格化 | §3.1 判定表 | `quarantined_ok ∧ close_ok ∧ is_closed ∧ no_tx_read_after_close`；隔离抛错即 K1=False |
+| T6′ 执行 | §1.2 T6′ / §5 / §3.3 | 不写 DB 事件、不 `set_phase`、phase 停 `COMMIT_ATTEMPTED`、只写 `migration-fault.log`、maintenance 保持 |
 
 ---
 
@@ -109,9 +118,9 @@ def append_reason(rec, code, detail):
 | 步 | 动作 | phase | 事件 |
 | --- | --- | --- | --- |
 | S1 | COMMIT 抛异常 → `commit_raised=True` | 仍 `COMMIT_ATTEMPTED` | 无（仅进程内） |
-| S2 | 先读一次 `in_transaction`（属性读，非 SQL）→ `quarantine(conn)`（此后业务 SQL 一律抛 `QuarantinedError`） | 不变 | 无 |
-| S3 | `if had_tx: conn_wrapper.rollback_for_migration()`（仅放行 `ROLLBACK` 的内部通道） | 不变 | 无 |
-| S4 | `close()` | 不变 | 无 |
+| S2 | 先读一次 `in_transaction`（属性读，非 SQL，**独立异常边界**，失败记 `UNKNOWN`）→ `quarantine(conn)`（**独立异常边界**，失败仍继续；此后业务 SQL 一律抛 `QuarantinedError`） | 不变 | 无 |
+| S3 | `if quarantined_ok and had_tx in (True, UNKNOWN): conn_wrapper.rollback_for_migration()`（仅放行 `ROLLBACK`；隔离未成功则跳过） | 不变 | 无 |
+| S4 | `close()`（**兜底必执行**，前序任何异常都不中断） | 不变 | 无 |
 | S5 | 探测连接 `BEGIN IMMEDIATE`→`ROLLBACK`→`close()` | 不变 | 无 |
 | S6 | K1 成立 → `set_phase(COMMIT_ATTEMPTED → UNKNOWN)`；K1 不成立 → **不转换**（T6′） | `UNKNOWN` / 仍 `COMMIT_ATTEMPTED` | **durable（首个）**；失败 → §2.4；K1 不成立时无事件 |
 | S7 | 新连接只读查询 token/对象 → 按 §2.3 判定 | 见 T4/T5/T7/T8 | 对应转换事件 |
@@ -235,7 +244,7 @@ else:
 | 句柄不再可用 | 包装对象 `is_closed == True`；`close()` 后任何方法抛 `ConnectionClosed` | — |
 | **不在关闭后读取事务属性** | — | **禁止** `conn.in_transaction`（对象已关闭，该属性无定义/无意义） |
 
-`in_transaction` 只在 **quarantine 之前**读取一次（属性读，不执行 SQL），用于决定是否需要发 `ROLLBACK`；读取发生在关闭之前，属"终止尝试"的一部分，**不作为 K1 的组成条件**。
+`in_transaction` 只在 **quarantine 之前**读取一次（属性读，不执行 SQL），用于决定是否需要尝试回滚；读取本身有独立异常边界（见下），读取失败记 `had_tx = UNKNOWN`。读取发生在关闭之前，属"终止尝试"的一部分，**不作为 K1 的组成条件**。
 
 **quarantine 与 ROLLBACK 的执行顺序（本轮修正）**
 
@@ -257,22 +266,60 @@ else:
 4. 失败（`SQLITE_BUSY`/已无事务/驱动错误）只 `non_db_log("rollback_for_migration_failed", ...)`，**不写数据库事件**，继续走 S4 `close()`；
 5. 该通道**不证明**事务状态，只做"尽力终止"；K1 也不因它成功而成立，K1 只看隔离 + close + 句柄。
 
+**S2 的异常保护（本轮修正）**
+
+上一版把 `conn.in_transaction` 与 `quarantine(conn)` 写在异常保护范围之外。这两步任何一步抛出（属性访问触发驱动错误、包装对象构造失败、内部状态锁冲突等），异常都会直接冒泡出迁移终止流程，**跳过 `close()`**，留下一个既未隔离又未关闭的原连接——正是最危险的残留。修正为"三段独立异常边界 + 无条件关闭 + 关闭后统一判定"。
+
+| 步骤 | 异常边界 | 抛错时 | 是否影响后续 |
+| --- | --- | --- | --- |
+| ① `had_tx = conn.in_transaction` | 独立 `try` | `had_tx = UNKNOWN`，`non_db_log("in_transaction_read_failed")` | **不影响**隔离、回滚尝试、关闭 |
+| ② `quarantine(conn)` | 独立 `try` | `quarantined_ok = False`，`non_db_log("quarantine_failed")` | **不影响**关闭（仍必须尝试） |
+| ③ `rollback_for_migration()` | 独立 `try`，前置条件 `quarantined_ok` | `non_db_log("rollback_for_migration_failed")` | **不影响**关闭 |
+| ④ `conn.close()` | 独立 `try`，**兜底必执行**（等价于 `finally` 语义） | `close_ok = False`，`non_db_log("conn_close_failed")` | — |
+
+规则细化：
+
+1. **①读取失败 → `had_tx = UNKNOWN`**：未知状态下，隔离成功后仍**尝试一次**回滚（尽力终止；`close()` 本身也会回滚，尝试只是提前结束事务），失败只记日志；**不得**把"尝试过回滚"当作"已知有事务"；
+2. **②隔离失败 → `quarantined_ok = False`**：此后**禁止**调用 `conn.execute(...)`（含 ROLLBACK），**也禁止**调用 `rollback_for_migration()`（该通道的前置条件是 `quarantined == True`，隔离未成功时调用只会抛 `IllegalRecoveryState`），只允许走 ④ 关闭；
+3. **③ 回滚通道只在 ② 成功后才可尝试**；失败不影响关闭，也不使 K1 成立；
+4. **④ 关闭无条件执行**：前面任何一步失败都不得中断关闭流程；关闭失败必须落 `migration-fault.log`；
+5. **K1 只看"可确认的事实"**：`quarantined_ok ∧ close_ok ∧ is_closed ∧ 关闭后未读事务属性`。其中 ② 抛错（隔离未确认）或 ④ 抛错（关闭未成功）**必然**使 K1 = False——隔离/关闭这类事实无法用别的事实补偿；而 `had_tx = UNKNOWN` 或 ③ 回滚失败**不**使 K1 为 False（它们不在这四个条件里）。
+
 ```python
-# 伪代码
-k1 = False
-had_tx = conn.in_transaction          # S2 前唯一一次属性读，不执行 SQL
-quarantine(conn)                      # 包装对象置 quarantined；此后 conn.execute 抛 QuarantinedError
-try:
-    if had_tx:
-        conn_wrapper.rollback_for_migration()     # 唯一内部通道，仅 ROLLBACK，最多 1 次
-except Exception as rb:
-    # 此刻 K1 未确认、S5 未完成 → 禁止任何数据库写入（含 append_reason / durable_write_event）
-    non_db_log("rollback_in_commit_path_failed", rb)                 # 仅非数据库日志
-try:
+# 伪代码：三段独立异常边界 + 无条件关闭
+had_tx        = UNKNOWN     # UNKNOWN / True / False
+quarantined_ok = False
+close_ok       = False
+k1             = False
+
+try:                                                  # ① 属性读，独立捕获
+    had_tx = conn.in_transaction
+except Exception as e:
+    had_tx = UNKNOWN
+    non_db_log("in_transaction_read_failed", e)       # 仅非数据库日志
+
+try:                                                  # ② 隔离，独立捕获
+    quarantine(conn)
+    quarantined_ok = True
+except Exception as e:
+    quarantined_ok = False
+    non_db_log("quarantine_failed", e)                # 隔离失败不阻断关闭
+
+if quarantined_ok and had_tx in (True, UNKNOWN):      # ③ 唯一内部回滚通道
+    try:
+        conn_wrapper.rollback_for_migration()         # 仅 ROLLBACK，最多 1 次
+    except Exception as e:
+        non_db_log("rollback_for_migration_failed", e)   # 不写数据库事件
+
+try:                                                  # ④ 兜底关闭，必执行
     conn.close()
-    k1 = conn_wrapper.is_closed and conn_wrapper.quarantined          # 关闭后不再读事务属性
-except Exception as cc:
-    non_db_log("conn_close_failed", cc)                              # K1 = False，同样只落文件日志
+    close_ok = True
+except Exception as e:
+    close_ok = False
+    non_db_log("conn_close_failed", e)
+
+# ⑤ 关闭之后再判定：只读包装对象标志，绝不读 conn.in_transaction
+k1 = quarantined_ok and close_ok and conn_wrapper.is_closed and conn_wrapper.no_tx_read_after_close
 ```
 
 **K1 判定的唯一口径**
@@ -280,7 +327,9 @@ except Exception as cc:
 | K1 | 条件组合 | 允许写 DB 事件 | phase 去向 |
 | --- | --- | --- | --- |
 | **成立** | 已隔离 ∧ `close()` 成功 ∧ 句柄不可用 ∧ 关闭后未读事务属性 | **允许**（S5 成功或失败都允许） | T6 → `UNKNOWN`；S7 再按 T4/T7/T8 判定 |
-| **不成立** | 上述任一缺失（隔离未置位 / `close()` 抛错 / 句柄仍可用） | **禁止**，无论 S5 是否成功 | **不转换**，停留 `COMMIT_ATTEMPTED`（T6′）；maintenance + 保守恢复或待人工 |
+| **不成立** | 上述任一缺失（隔离未置位或隔离抛错 / `close()` 抛错 / 句柄仍可用 / 关闭后读过事务属性） | **禁止**，无论 S5 是否成功 | **不转换**，停留 `COMMIT_ATTEMPTED`（T6′）；maintenance + 保守恢复或待人工 |
+
+> `had_tx = UNKNOWN` 本身**不**使 K1 为 False（它不是 K1 的条件）；但"隔离抛错"必然使 K1 为 False，"关闭抛错"也必然使 K1 为 False。
 
 **隔离期的写入禁令（本轮新增，硬性）**
 
@@ -325,7 +374,7 @@ except Exception as cc:
 | K1、S5 均失败 | 无 DB 事件、仅文件日志、phase 停留 `COMMIT_ATTEMPTED`、保守恢复 |
 | 他进程重新取得写锁且拒绝释放 | 不重试、不杀进程；`abort_recovery`，人工介入 |
 
-### 3.4 测试（MC14–MC21）
+### 3.4 测试（MC14–MC24）
 
 | # | 初始 | 步骤 | 预期 |
 | --- | --- | --- | --- |
@@ -338,6 +387,9 @@ except Exception as cc:
 | MC17 | S5 成功，随后注入他进程写锁 | 替换前 S5′ | 检出 → `abort_recovery`（码 4）；文件未替换；备份 sha256 不变 |
 | MC18 | K1 成立、S5 成立、token 不可见、对象不可见 | 判定（分别从 `COMMIT_ATTEMPTED` 与 `UNKNOWN` 两态各跑一次） | `COMMIT_ATTEMPTED → TX_ROLLED_BACK`（T5）/ `UNKNOWN → TX_ROLLED_BACK`（T8）；终止；无 success |
 | MC21 | K1 成立、**S5 曾失败**、token 不可见、对象不可见 | 判定 | **仍 `UNKNOWN`**（T8′ 禁止）；无 `→TX_ROLLED_BACK` 事件；不写 success；不开写入；保守恢复 |
+| MC22 | `conn.in_transaction` 属性读取抛异常 | 观察调用序列 | 仍执行 `quarantine()` 与 `close()`（close 尝试次数 = 1）；`had_tx=UNKNOWN` 只用于决定回滚尝试，**不进 K1**；若隔离与关闭均成功则 K1 可成立，否则 K1=False |
+| MC23 | `quarantine(conn)` 抛异常 | 观察 | 仍执行 `close()`（尝试次数 = 1）；**不调用** `conn.execute` / `rollback_for_migration()`；K1 = **False**；DB 写入次数 = 0；phase 保持 `COMMIT_ATTEMPTED`；maintenance = 开 |
+| MC24 | 属性读与 `quarantine` 均抛异常 | 观察 | 仍执行 `close()`（尝试次数 = 1）；K1 = **False**；DB 写入次数 = 0；phase 保持 `COMMIT_ATTEMPTED`；maintenance = 开；仅 `migration-fault.log`（两条记录、无 success） |
 
 ---
 
@@ -432,6 +484,8 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | UNKNOWN | UNKNOWN | — | **禁止**（用 `append_reason`） | — | `IllegalTransition` |
 | COMMITTED | 任意 | — | **禁止回退**（阶段 C 失败用 `migration_rollback` 事件） | — | — |
 
+> **S2 异常不产生任何转换**：属性读、隔离、回滚三段中的任一抛错，都只写 `migration-fault.log`；`phase` 仍为 `COMMIT_ATTEMPTED`。若隔离确认且关闭成功 → 走 T6 写 `→UNKNOWN`；否则走 T6′（无转换）。
+
 ---
 
 ## 6. 逐项关闭说明（含实际逻辑）
@@ -452,7 +506,8 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | 要求 | 落实 |
 | --- | --- |
 | 异常后先记进程内状态 | S1 仅 `commit_raised` |
-| 严格 S2–S5 | §1.3 表 |
+| 严格 S2–S5 | §1.3 表；S2 三段各自独立 `try`，`close()` 兜底 |
+| S2 异常不中断关闭 | §3.1 异常边界表（close 独立 try、必执行） |
 | 隔离后再写事件 | `→UNKNOWN` 位于 S6，S5 之后；K1 不成立时 S6 不转换 |
 | 隔离失败不强写审计 | 规则 1–2：只用 `<data_dir>/migration-fault.log` |
 | 所有 durable 时点明确 | §1.3 五类事件表 + 硬规则 3 |
@@ -486,7 +541,8 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | close 失败/探测失败/被抢写锁 | §3.3 五种情形表（close 失败停 `COMMIT_ATTEMPTED`，不判 UNKNOWN） |
 | **隔离期禁写数据库** | §3.1 禁令表：S2–S5 未完成前只允许 `migration-fault.log`；ROLLBACK 失败分支也走非 DB 日志 |
 | quarantined 与 ROLLBACK 兼容 | §3.1 `rollback_for_migration()` 通道表（只放行 `ROLLBACK`，其他抛 `IllegalRecoverySql`） |
-| 专门测试 | MC14–MC21（各自独立，非一个通用 UNKNOWN） |
+| S2 三段独立异常边界 | §3.1 异常边界表 + 伪代码（属性读/隔离/回滚各自 try，close 兜底） |
+| 专门测试 | MC14–MC24（各自独立，非一个通用 UNKNOWN） |
 
 ### 6.5 P1-2 独立夹具
 
@@ -515,7 +571,7 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | RC | 6 | 6 | — |
 | CF | 8 | 8 | — |
 | AU | 9 | 9 | — |
-| MC | 12 | **25** | +MC13–MC18；二次修订 +MC19–MC20；三次修订 +MC21、MC15b/15c/15d、MC13b |
+| MC | 12 | **28** | +MC13–MC18；二次修订 +MC19–MC20；三次修订 +MC21、MC15b/15c/15d、MC13b；四次修订 +MC22–MC24 |
 | CR | 5 | 5 | — |
 | FX | 3 | **4** | +FX4 |
 | PH | 5 | **11** | +PH6–PH11 |
@@ -531,6 +587,7 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | MC19 + §1.3 | 隔离未确认期间 DB 写入次数 0，故障只落文件日志 |
 | MC20 + T7′ | K1 成立但 S5 失败 + token 可见 → 仍 `UNKNOWN`，无 `→COMMITTED`、无 success |
 | MC21 + T8′ | K1 成立但 S5 失败 + token 与对象均不可见 → 仍 `UNKNOWN`，无 `→TX_ROLLED_BACK` |
+| MC22–MC24 + T6′ | S2 任一异常 → close 尝试 ≥1 次、DB 写入 0；隔离失败则 K1=False、phase 停 `COMMIT_ATTEMPTED` |
 | MC15 + MC16 | 同一 K1 判定口径：K1 成立才写事件；K1 不成立一律不写（S5 结果不影响） |
 | R10-A1 + R10-A2 | 两库各自 `id=2`，互不影响 |
 
@@ -551,6 +608,8 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | K1 四条件 | §3.1 伪代码 | §3.1 判定表 | MC15 |
 | K1 不成立即不写库 | T6′ 分支（无 `set_phase`） | §5 `COMMIT_ATTEMPTED → （无转换）` 行 | MC14/MC15 |
 | quarantine 后仍能终止 | `rollback_for_migration()` 只放行 ROLLBACK | §3.1 通道表 | MC15b/MC15c/MC15d |
+| S2 不中断关闭 | 三段独立 try + 兜底 close | §3.1 异常边界表 | MC22/MC23/MC24 |
+| 隔离失败仍关闭且 K1=False | `quarantined_ok=False` → `k1=False` | §3.1 判定表 | MC23/MC24 |
 | S5 独立 | §3.2 | §3.3 | MC16–MC18 |
 | T8 五条件 | §1.2 T8 | §5 `UNKNOWN→TX_ROLLED_BACK` 行 | MC18/MC21 |
 | T8′ 禁止分支 | 判定处显式 `if s5_failed: stay UNKNOWN` | §1.2 T8′ | MC21 |
@@ -598,7 +657,8 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | 12 | quarantine 语义吞掉 ROLLBACK → 原事务永不终止、K1 恒 False | `rollback_for_migration()` 单点放行（只 ROLLBACK、最多 1 次） | MC15b/MC15c/MC15d |
 | 13 | K1 不成立但仍借 S5 成功写库 → 撞锁被误读 | T6′：K1 是唯一写库闸门 | MC14/MC15 |
 | 14 | 看不到 token 就当已回滚（T8 条件不全） | T8 五条件 + T8′ 禁止 | MC18/MC21 |
+| 15 | S2 属性读/隔离抛错中断流程 → 原连接未隔离、未关闭残留 | 三段独立异常边界 + 兜底 `close()` + K1 严格化 | MC22/MC23/MC24 |
 
 ---
 
-**v1.10 到此结束。** 三次修订合计**未编写代码、未执行迁移、未修改数据库、未修改生产配置或生产数据**；三次修订累计只处理"五项 + 两项 + 三项"状态机与伪代码矛盾。**C11–C20 全部未确认，C12 仍未被本轮视为已批准。** 文档交回总体设计最终审查；未获批准前不提交 P-1 实施计划、不进入任何实施阶段。
+**v1.10 到此结束。** 四次修订合计**未编写代码、未执行迁移、未修改数据库、未修改生产配置或生产数据**；四次修订累计只处理"五项 + 两项 + 三项 + S2 异常保护"的状态机与伪代码矛盾。**C11–C20 全部未确认，C12 仍未被本轮视为已批准。** 文档交回总体设计最终审查；未获批准前不提交 P-1 实施计划、不进入任何实施阶段。
