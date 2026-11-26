@@ -1,5 +1,5 @@
 #!/bin/sh
-# NodePoolME P-1 生产探针 v1.10（r2：目标自识别版）
+# NodePoolME P-1 生产探针 v1.10（r5：目标自识别 + fnOS 兼容）
 # 只读探针（P-7 写测试单独审批）。核心原则：目标不明确就停止，绝不猜测路径或容器。
 #
 # 用法（NAS 宿主机，有 docker）：
@@ -7,12 +7,14 @@
 # 用法（已在容器内）：
 #   PROBE_MODE=container sh NodePoolME-P-1-生产探针-v1.10.sh
 # P-7（唯一写操作）：NODEPOOL_P7_APPROVED=1 且 STATE_DIR 已确认存在，才会执行
-# 其它覆盖：NODEPOOL_CONTAINER=<名>、NODEPOOL_HEALTHZ=<url>
+# 其它覆盖：NODEPOOL_CONTAINER=<名>、NODEPOOL_HEALTHZ=<url>、
+#           NODEPOOL_DOCKER='sudo docker'（无 docker 组权限时）、NODEPOOL_P7_FAULT=(仅测试用)
 set -u
 
 PROBE_MODE="${PROBE_MODE:-host}"
 P7_APPROVED="${NODEPOOL_P7_APPROVED:-0}"
 HEALTHZ="${NODEPOOL_HEALTHZ:-}"
+DOCKER="${NODEPOOL_DOCKER:-docker}"   # 需 sudo 时设 NODEPOOL_DOCKER="sudo docker"
 P7_STATE="未执行"
 SCRIPT_RC=0
 
@@ -32,20 +34,20 @@ if [ "$PROBE_MODE" = "container" ]; then
   say "PROBE_MODE=container：跳过 docker 侧检查，路径以进程内配置为准"
   say "注意：容器内看不到宿主机↔容器映射，P-7 会被跳过"
 else
-  command -v docker >/dev/null 2>&1 || die "宿主机没有 docker CLI，无法定位生产容器"
+  command -v "${DOCKER%% *}" >/dev/null 2>&1 || die "宿主机没有 docker CLI，无法定位生产容器"
   if [ -n "${NODEPOOL_CONTAINER:-}" ]; then
     CNAME="${NODEPOOL_CONTAINER}"
-    docker inspect "$CNAME" >/dev/null 2>&1 || die "指定的容器 '$CNAME' 不存在"
+    $DOCKER inspect "$CNAME" >/dev/null 2>&1 || die "指定的容器 '$CNAME' 不存在"
   else
-    CANDS=$(docker ps --format '{{.Names}}|{{.Image}}' | grep -i 'nodepool' || true)
+    CANDS=$($DOCKER ps --format '{{.Names}}|{{.Image}}' | grep -i 'nodepool' || true)
     N=$(printf '%s\n' "$CANDS" | grep -c . || true)
     [ "${N:-0}" -eq 0 ] && die "docker ps 里没有运行中的 nodepool 容器（容器未运行/未部署）"
     [ "$N" -gt 1 ] && { printf '%s\n' "$CANDS"; die "匹配到 $N 个候选容器，容器不唯一。请用 NODEPOOL_CONTAINER=<name> 指定后重跑"; }
     CNAME=$(printf '%s\n' "$CANDS" | cut -d'|' -f1)
   fi
   say "container_name  $CNAME"
-  docker inspect "$CNAME" --format '{{.State.Status}} started={{.State.StartedAt}} restart={{.HostConfig.RestartPolicy.Name}}' 2>/dev/null
-  docker inspect "$CNAME" --format '{{.State.Status}}' 2>/dev/null | grep -q running \
+  $DOCKER inspect "$CNAME" --format '{{.State.Status}} started={{.State.StartedAt}} restart={{.HostConfig.RestartPolicy.Name}}' 2>/dev/null
+  $DOCKER inspect "$CNAME" --format '{{.State.Status}}' 2>/dev/null | grep -q running \
     || die "容器 $CNAME 不在 running 状态，在线探针无法执行"
 fi
 
@@ -53,7 +55,7 @@ fi
 hr "1) 挂载关系（宿主机 ↔ 容器）"
 MOUNTS=""
 if [ "$PROBE_MODE" = "host" ]; then
-  MOUNTS=$(docker inspect "$CNAME" --format '{{range .Mounts}}{{.Source}}|{{.Destination}}|{{.Type}}{{"\n"}}{{end}}' 2>/dev/null | sed '/^$/d')
+  MOUNTS=$($DOCKER inspect "$CNAME" --format '{{range .Mounts}}{{.Source}}|{{.Destination}}|{{.Type}}{{"\n"}}{{end}}' 2>/dev/null | sed '/^$/d')
   printf '%s\n' "$MOUNTS"
   [ -z "$MOUNTS" ] && die "挂载信息为空，无法建立容器路径 → 宿主机路径映射"
   printf '%s\n' "$MOUNTS" | awk -F'|' '$3!="bind"{print "NON_BIND: "$0}'
@@ -61,21 +63,17 @@ fi
 
 # 容器路径 → 宿主机路径（最长目标前缀匹配；未命中返回空）
 map_host() {
-  printf '%s\n' "$MOUNTS" | while IFS='|' read -r _src _dst _typ; do
-    [ -n "${_dst:-}" ] || continue
-    case "$1" in
-      "$_dst"|"$_dst"/*) echo "${#_dst}|$_src|$_dst";;
-    esac
-  done | sort -t'|' -k1,1nr | head -1 | while IFS='|' read -r _len _src _dst; do
-    [ -n "${_src:-}" ] || exit 0
-    echo "$_src${1#"$_dst"}"
-  done
+  printf '%s\n' "$MOUNTS" | awk -F'|' -v p="$1" '
+    { if ($2=="") next;
+      if (p==$2 || index(p, $2"/")==1) { if (length($2)>best) { best=length($2); src=$1; dst=$2 } } }
+    END { if (best>0) { rest=substr(p, best+1); print src rest } }'
 }
+
 
 # ---------------------------------------------------------------- 2) 容器内真实路径
 hr "2) 容器内真实路径与版本（只取运行中的配置）"
 if [ "$PROBE_MODE" = "host" ]; then
-  RUN() { docker exec -i "$CNAME" "$@"; }
+  RUN() { $DOCKER exec -i "$CNAME" "$@"; }
 else
   RUN() { "$@"; }
 fi
@@ -174,20 +172,20 @@ fi
 # ---------------------------------------------------------------- 3) P-10
 hr "3) P-10：镜像 ID / RepoDigests / 版本（四值核对）"
 if [ "$PROBE_MODE" = "host" ]; then
-  ITAG=$(docker inspect "$CNAME" --format '{{.Config.Image}}' 2>/dev/null)
-  IID=$(docker inspect "$CNAME" --format '{{.Image}}' 2>/dev/null)
+  ITAG=$($DOCKER inspect "$CNAME" --format '{{.Config.Image}}' 2>/dev/null)
+  IID=$($DOCKER inspect "$CNAME" --format '{{.Image}}' 2>/dev/null)
   say "image_ref(Config.Image) $ITAG"
   say "image_id(running)       $IID"
   [ -n "$IID" ] || die "取不到运行容器的 .Image（不可变 image ID）"
-  TAGID=$(docker image inspect "$ITAG" --format '{{.Id}}' 2>/dev/null || true)
+  TAGID=$($DOCKER image inspect "$ITAG" --format '{{.Id}}' 2>/dev/null || true)
   say "image_id(tag_now)       ${TAGID:-<unresolved>}"
   if [ -n "$TAGID" ] && [ "$TAGID" != "$IID" ]; then
     say "TAG_DRIFT: 标签当前指向 ${TAGID}，运行中的是 $IID（判定以 image_id 为准）"
   fi
   say "--- RepoDigests（按 image_id 查询）---"
-  docker image inspect "$IID" --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null | sed '/^$/d' | sed 's/^/  digest  /'
+  $DOCKER image inspect "$IID" --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null | sed '/^$/d' | sed 's/^/  digest  /'
   REPO=$(printf '%s' "$ITAG" | sed 's/:.*$//')
-  ND=$(docker image inspect "$IID" --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null | grep -c "^${REPO}@" || true)
+  ND=$($DOCKER image inspect "$IID" --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null | grep -c "^${REPO}@" || true)
   say "digests_for_repo($REPO) ${ND:-0}"
   case "${ND:-0}" in
     0) say "VERDICT_digest ABSENT：镜像为本地构建/未推送，基线不可溯源 ⇒ 禁止登记基线";;
