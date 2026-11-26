@@ -6,6 +6,7 @@
 **本轮性质**：纯设计修订。**未编写代码、未执行迁移、未修改数据库、未修改生产配置或生产数据。**
 **本轮范围**：五项——phase 切换重复与状态表、COMMIT 异常路径 durable 事件时序、`set_phase()` 事件失败补偿、K1 与 S5 职责分离、R10-A1/A2 独立夹具。**未扩展其他架构。**
 **文档状态**：**待总体设计最终审查**（本文未自行认定通过；C11–C20 未确认）
+**二次修订（Final Two Fixes）**：① 隔离完成前禁止任何数据库事件写入（含 `append_reason`，改走 `migration-fault.log`）；② `UNKNOWN → COMMITTED` 收紧为四条件（token ∧ K1 ∧ S5 ∧ 事件成功），并新增 T7′ 禁止分支（S5 曾失败则永不转 COMMITTED）。改动点见 §0.1。
 
 ---
 
@@ -20,6 +21,14 @@
 | P1-2 | R10-A1/A2 各用独立数据库副本，禁止顺序依赖 | §4 | 修正 |
 
 未修订：Q1–Q12、七个触发器、`nodes` 禁 UPSERT、配置升级原子流程、连接五类型与 `write_guard`、C-2 入向判定、`valid=0` 隔离、17 步主序号、备份首选与 F1–F9、C12–C16 捕获边界、时间与阈值参数、§2.3 判定表（本轮只补 K1/K2 的证明方式，不改判定分支）。**C11–C20 全部未确认；C12 未批准，默认 A 路径。**
+
+### 0.1 二次修订改动点（Final Two Fixes）
+
+| 项 | 位置 | 改动 |
+| --- | --- | --- |
+| P0-1 隔离期禁写库 | §3.1 伪代码与禁令表 | `ROLLBACK` 失败分支由 `append_reason()` 改为 `non_db_log()`；新增"隔离期只许写 `migration-fault.log`"硬规则 |
+| P0-2 收紧 T7 | §1.2（T7、新增 T7′）、§2.3、§6.3、§8 | `UNKNOWN → COMMITTED` 需四条件；S5 曾失败 → 永久停留 UNKNOWN，禁止转 COMMITTED |
+| 测试 | §2.5、§3.4、§7、§8 | 新增 MC19（隔离完成前 DB 写入次数 0）、MC20（K1 成立 + S5 失败 + token 可见 → 仍 UNKNOWN） |
 
 ---
 
@@ -47,7 +56,8 @@
 | T4 | `COMMIT_ATTEMPTED → COMMITTED` | token 可见 ∧ K1 成立 ∧ K2 成立 | 隔离完成后 | 三条件任一不成立 → 见 T6/§2.4 |
 | T5 | `COMMIT_ATTEMPTED → TX_ROLLED_BACK` | token 不可见 ∧ 迁移对象不可见 ∧ K1/K2 成立 | 隔离完成后 | 事件失败 → 仍终止 |
 | T6 | `COMMIT_ATTEMPTED → UNKNOWN` | COMMIT 抛异常 ∧ S2–S5 完成（K1 成立，S5 探测成功或失败均可） | **S5 之后**（唯一时点） | 事件写失败 → 见 §2.4，仍保守恢复 |
-| T7 | `UNKNOWN → COMMITTED` | 隔离后 token 可见（仅 T6 之前的短暂态不需要，保留为兜底） | 隔离完成后 | 事件失败 → 停留 UNKNOWN + 保守恢复 |
+| T7 | `UNKNOWN → COMMITTED` | 隔离后 token 可见 **∧ K1 成立 ∧ S5 成功 ∧ `durable` 事件写入成功**（四条件缺一不可） | 隔离完成后 | 任一不满足 → 停留 `UNKNOWN` + 保守恢复 |
+| T7′ | `UNKNOWN → COMMITTED`（此前 S5 失败过） | **禁止**——即使后续 token 可见 | — | 保持 `UNKNOWN`，继续保守恢复 |
 | T8 | `UNKNOWN → TX_ROLLED_BACK` | 隔离后 token 与对象均不可见 | 隔离完成后 | 事件失败 → 仍终止 |
 | — | **`UNKNOWN → UNKNOWN` 禁止** | 需要追加新原因 | — | 用 `append_reason()` 写独立事件（`migration_note`），**不改 phase** |
 
@@ -78,7 +88,9 @@ def append_reason(rec, code, detail):
 1. 隔离未确认前，**禁止**用独立连接写任何 `durable` 事件（SQLite 单写者：第二写者会 `SQLITE_BUSY`，且失败会污染恢复判断）；
 2. 隔离未确认时，故障记录走**非数据库通道**：`<data_dir>/migration-fault.log`（追加写、含 `migration_id/token/reason/ts`），并在进程退出码中体现；
 3. 隔离确认后的第一个 `durable` 事件必须是 `COMMIT_ATTEMPTED→UNKNOWN`（或 `→COMMITTED`/`→TX_ROLLED_BACK`），**不得**在此之前插入其它审计写；
-4. 所有 `durable` 写都用短 `busy_timeout`（≤500ms）+ 单次尝试，不重试。
+4. 所有 `durable` 写都用短 `busy_timeout`（≤500ms）+ 单次尝试，不重试；
+5. **K1 未确认期间的任何异常（含 `ROLLBACK` 失败、`close()` 失败）一律只写 `migration-fault.log`**，禁止 `append_reason()` / `durable_write_event()` / 任何 `INSERT`——因为此时原连接可能仍持写锁，写库会 `SQLITE_BUSY` 并把"写不进去"误当成"状态异常"；
+6. S7 判定若走 T7（`UNKNOWN → COMMITTED`），必须**同时**复核 K1、S5 与事件写入成功；**S5 曾失败即永久停留 UNKNOWN**（T7′），即使 token 事后可见。
 
 **时序对照（替换 v1.9 §2.2 的 S1–S7 表述）**
 
@@ -169,6 +181,7 @@ else:
 | --- | --- | --- | --- |
 | `COMMIT_ATTEMPTED → UNKNOWN`（因 `→COMMITTED` 事件失败） | **允许**（T6 的另一触发条件） | 状态未曾进入 COMMITTED，故不需要"降级"语义 | 该事件也失败 → 见下 |
 | `UNKNOWN → COMMITTED` 失败后停留 UNKNOWN | 允许（不转换） | 停留即安全 | 走保守恢复 |
+| `UNKNOWN → COMMITTED` 但 **S5 曾失败** | **不允许** | S5 失败意味着"探测时刻存在写者"，token 可见也不足以证明外部世界已稳定 | 保持 `UNKNOWN`，继续保守恢复；不写 success、不开放写入 |
 | 二次补偿也失败（T6 事件失败） | — | **不推进任何状态** | 保持 maintenance；非数据库日志；`handle_post_commit_failure`；非零退出；**绝不开放写入** |
 | `COMMITTED → UNKNOWN` | **不允许** | 一旦 COMMITTED 已确认，后续失败属阶段 C，由 `handle_post_commit_failure` 处理，phase 不再回退（事件记 `migration_rollback`） | — |
 
@@ -184,13 +197,15 @@ else:
 
 三者必须一致：`COMMITTED` 出现在内存与事件中 ⇒ `enter_phase_c` 被调用一次；事件里没有 `COMMITTED` ⇒ 内存不得为 `COMMITTED` ⇒ 未进入阶段 C ⇒ 无 success、写入仍关闭。
 
-### 2.5 测试（PH9–PH11）
+### 2.5 测试（PH9–PH11 + MC19–MC20）
 
 | # | 初始 | 步骤 | 预期 |
 | --- | --- | --- | --- |
 | PH9 | token 可见、K1/K2 成立，`→COMMITTED` 事件写失败 | 注入写失败 | `set_phase` 返回 False；内存仍 `COMMIT_ATTEMPTED`；随后 T6 转 `UNKNOWN`；**未进入阶段 C**；无 success；写入关闭 |
 | PH10 | 同上，且 T6 事件也失败 | 注入两次失败 | 无任何 `migration_phase` 事件；内存停留 `COMMIT_ATTEMPTED`；maintenance 保持；非数据库日志有两条；保守恢复执行；退出码非零 |
 | PH11 | 同 PH10 | 检查写入入口与 success | 写入 503；`schema_migrations` 中该 mid 无 `success`；三重一致性断言全过 |
+| MC19 | COMMIT 抛异常，且 `ROLLBACK` 抛错 | 注入 ROLLBACK 失败；统计 S4/S5 完成前的数据库写入 | S4（close）与 S5（探测）**完成之前**，`system_events` 写入次数 == **0**；该异常只出现在 `migration-fault.log`；K1 判 False → `UNKNOWN`；无 success |
+| MC20 | `UNKNOWN` 态；K1 成立、S5 曾失败、新连接 token 可见 | 走 T7 判定 | **仍为 `UNKNOWN`**（T7′ 禁止）；不进入阶段 C；无 `→COMMITTED` 事件；无 success；保守恢复；写入关闭 |
 
 ---
 
@@ -215,13 +230,23 @@ try:
     if conn.in_transaction:            # 关闭前的唯一读取
         conn.execute("ROLLBACK")
 except Exception as rb:
-    append_reason(rec, "rollback_in_commit_path_failed", str(rb))     # 不据此判成功
+    # 此刻 K1 未确认、S5 未完成 → 禁止任何数据库写入（含 append_reason / durable_write_event）
+    non_db_log("rollback_in_commit_path_failed", rb)                 # 仅非数据库日志
 try:
     conn.close()
     k1 = conn_wrapper.is_closed and conn_wrapper.quarantined          # 关闭后不再读事务属性
 except Exception as cc:
-    non_db_log("conn_close_failed", cc)                              # K1 = False
+    non_db_log("conn_close_failed", cc)                              # K1 = False，同样只落文件日志
 ```
+
+**隔离期的写入禁令（本轮新增，硬性）**
+
+| 阶段 | 允许的记录通道 | 禁止 |
+| --- | --- | --- |
+| S2–S5 未完成（K1 未确认） | `<data_dir>/migration-fault.log`（追加写，含 `migration_id/token/reason/ts`）、标准错误 | `append_reason()`、`durable_write_event()`、`set_phase()`、任何 `INSERT/UPDATE` |
+| S5 完成且 K1 成立 | 非数据库日志 + 按 §1.3 写 `durable` 事件 | 早于 `→UNKNOWN` 的其它审计写 |
+
+理由与 §1.3 硬规则 1–2 同源：原连接可能仍持写锁，第二写者会 `SQLITE_BUSY`，把"无法写事件"误判成"迁移状态异常"，污染后续判定；而且一旦写入失败，会诱导流程走向错误的补偿分支。
 
 ### 3.2 S5（瞬时无写者探测）——独立职责
 
@@ -256,7 +281,7 @@ except Exception as cc:
 | S5 失败但 K1 成立 | 仍 `UNKNOWN`（K2 不成立）；允许写 `→UNKNOWN` 事件（原连接已关，不存在写锁）；随后保守恢复 |
 | 他进程重新取得写锁且拒绝释放 | 不重试、不杀进程；`abort_recovery`，人工介入 |
 
-### 3.4 测试（MC15–MC18）
+### 3.4 测试（MC15–MC20）
 
 | # | 初始 | 步骤 | 预期 |
 | --- | --- | --- | --- |
@@ -350,7 +375,8 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | COMMIT_ATTEMPTED | COMMITTED | token ∧ K1 ∧ K2 ∧ 事件成功 | durable | S5 后 | 事件失败 → T6 |
 | COMMIT_ATTEMPTED | TX_ROLLED_BACK | 无 token ∧ 无对象 ∧ K1/K2 | durable | S5 后 | 事件失败仍终止 |
 | COMMIT_ATTEMPTED | UNKNOWN | COMMIT 抛异常 ∧ S2–S5 完成 | durable | **S5 后（唯一）** | 事件失败 → 非 DB 日志 + 恢复 |
-| UNKNOWN | COMMITTED | 隔离后 token 可见（兜底） | durable | 查询后 | 失败 → 停留 UNKNOWN + 恢复 |
+| UNKNOWN | COMMITTED | token 可见 **∧ K1 ∧ S5 成功 ∧ 事件成功**（四条件） | durable | 查询后 | 任一不满足 → 停留 UNKNOWN + 恢复 |
+| UNKNOWN | COMMITTED（S5 曾失败） | **禁止（T7′）** | — | — | 保持 UNKNOWN；不写 success、不开写入 |
 | UNKNOWN | TX_ROLLED_BACK | 隔离后两者均不可见 | durable | 查询后 | 失败 → 仍终止 |
 | UNKNOWN | UNKNOWN | — | **禁止**（用 `append_reason`） | — | `IllegalTransition` |
 | COMMITTED | 任意 | — | **禁止回退**（阶段 C 失败用 `migration_rollback` 事件） | — | — |
@@ -389,11 +415,13 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | 事件失败不得对外使用新状态 | `set_phase` 返回 False，`rec.phase` 仍旧值 |
 | COMMITTED 四条件 | §2.2 门禁（token/K1/K2/事件） |
 | 任一失败不进阶段 C | `to_unknown()` → 保守恢复 |
+| T7 四条件（含 S5） | §1.2 T7 + §2.3（S5 曾失败即禁止 `→COMMITTED`） |
 | 内存处理明确 | 明确"不推进"，由调用方决定 T6 |
 | 补偿转换定义 | §2.3 表（允许 T6 补偿；禁 COMMITTED 回退） |
 | 二次补偿失败 | 不推进任何状态；maintenance + 非 DB 日志 + 恢复 |
 | PH5 三重断言 | §2.4 表 |
 | 不靠"调用了恢复函数"判定 | PH9–PH11 断言内存 phase、事件序列、`enter_phase_c` 调用次数、success 存在性 |
+| T7 条件不完整 | MC20：K1 成立、S5 失败、token 可见 → 仍 UNKNOWN |
 
 ### 6.4 P1-1 K1 / S5
 
@@ -403,7 +431,8 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | S5 独立定义 | §3.2 表（瞬时探测、不得替代 K1、必须关探测连接） |
 | S5 后持续封锁 | §3.3 六通道表 + S5′ 复探 |
 | close 失败/探测失败/被抢写锁 | §3.3 四种情形表 |
-| 专门测试 | MC15–MC18（各自独立，非一个通用 UNKNOWN） |
+| **隔离期禁写数据库** | §3.1 禁令表：S2–S5 未完成前只允许 `migration-fault.log`；ROLLBACK 失败分支也走非 DB 日志 |
+| 专门测试 | MC15–MC20（各自独立，非一个通用 UNKNOWN） |
 
 ### 6.5 P1-2 独立夹具
 
@@ -432,7 +461,7 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | RC | 6 | 6 | — |
 | CF | 8 | 8 | — |
 | AU | 9 | 9 | — |
-| MC | 12 | **16** | +MC13–MC18 |
+| MC | 12 | **18** | +MC13–MC18；二次修订 +MC19–MC20 |
 | CR | 5 | 5 | — |
 | FX | 3 | **4** | +FX4 |
 | PH | 5 | **11** | +PH6–PH11 |
@@ -445,6 +474,8 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | PH9 + CR1 | 事件失败 → 未进阶段 C → 无 success |
 | PH10 + PH11 | 二次补偿失败 → 三重一致（内存 `COMMIT_ATTEMPTED`、无事件、未进 C） |
 | MC17 + RC4 | 两道关卡（S5′ 与连接关闭）都能拦下替换 |
+| MC19 + §1.3 | 隔离未确认期间 DB 写入次数 0，故障只落文件日志 |
+| MC20 + T7′ | K1 成立但 S5 失败 + token 可见 → 仍 `UNKNOWN`，无 `→COMMITTED`、无 success |
 | R10-A1 + R10-A2 | 两库各自 `id=2`，互不影响 |
 
 ---
@@ -463,6 +494,9 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | 补偿合法性 | `to_unknown` | §2.3 表 | PH10/PH11 |
 | K1 四条件 | §3.1 伪代码 | §3.1 表 | MC15 |
 | S5 独立 | §3.2 | §3.3 | MC16–MC18 |
+| 隔离期禁写库 | §3.1 `non_db_log` 分支 | §3.1 禁令表 / §1.3 硬规则 1–2 | MC19 |
+| T7 四条件 | §1.2 T7 | §5 `UNKNOWN→COMMITTED` 行 | MC20 |
+| T7′ 禁止分支 | 判定处显式 `if s5_failed: stay UNKNOWN` | §1.2 T7′ / §2.3 | MC20 |
 | 独立夹具 | §4.2 | — | FX4/R10-A0/A1/A2 |
 
 **逐条结论**：伪代码中的每个 `set_phase` 调用都能在 §5 找到唯一一行；§5 每行至少一条测试；未出现"状态表有转换但代码无调用"（`UNKNOWN→COMMITTED` 为兜底，代码中有对应分支但正常路径不触发，已注明）；也未出现"代码有转换但状态表未定义"。
@@ -499,6 +533,8 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | 7 | S5 后他进程抢写 | 替换前 S5′ 复探 | MC17 |
 | 8 | 两 REPLACE 用例共库导致 `id=3` | 独立副本 + 单次执行 | FX4/R10-A1/A2 |
 | 9 | C-2 误停导致迁移中断 | 误停只影响单表 | M30/M32 |
+| 10 | 隔离未完成时写库 → `SQLITE_BUSY` 被误读 | §3.1 禁令表：只许 `migration-fault.log` | MC19 |
+| 11 | S5 曾失败但 token 事后可见 → 误转 COMMITTED | T7′ 禁止分支；四条件复核 | MC20 |
 
 ---
 
