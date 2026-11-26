@@ -14,6 +14,7 @@ PROBE_MODE="${PROBE_MODE:-host}"
 P7_APPROVED="${NODEPOOL_P7_APPROVED:-0}"
 HEALTHZ="${NODEPOOL_HEALTHZ:-}"
 P7_STATE="未执行"
+SCRIPT_RC=0
 
 hr()  { echo; echo "===== $* ====="; }
 say() { echo "$*"; }
@@ -79,44 +80,63 @@ else
   RUN() { "$@"; }
 fi
 
+# 2.1 导入前先查"会不会被建目录"（config.py 导入时对 5 个目录做 mkdir exist_ok）
+PRE=$(RUN python -c "
+import json,os
+from pathlib import Path
+data=str(Path(os.getenv('NODEPOOL_DATA_DIR','./data')).resolve())
+def p(v): return str(Path(v).resolve())
+pre={'DATA_DIR':data,
+     'CONFIG_DIR':p(os.getenv('NODEPOOL_CONFIG_DIR') or (Path(data)/'config')),
+     'LOG_DIR':p(os.getenv('NODEPOOL_LOG_DIR') or (Path(data)/'logs')),
+     'BACKUP_DIR':p(os.getenv('NODEPOOL_BACKUP_DIR') or (Path(data)/'backup')),
+     'SUB_DIR':p(str(Path(data)/'sub')),
+     'DB_PATH':p(os.getenv('NODEPOOL_DB') or (Path(data)/'nodepool.db')),
+     'STATE_DIR':p(os.getenv('NODEPOOL_STATE_DIR') or (Path(data)/'state'))}
+mk=['DATA_DIR','CONFIG_DIR','LOG_DIR','BACKUP_DIR','SUB_DIR']
+missing=[k for k in mk if not Path(pre[k]).exists()]
+print(json.dumps({'pre':pre,'missing':missing,'mkdir_dirs':mk}))
+" 2>&1) || true
+
+PREJ=$(printf '%s\n' "$PRE" | tail -1)
+MISSING=$(printf '%s' "$PREJ" | sed -n 's/.*"missing": *\[\([^]]*\)\].*/\1/p')
+if [ -z "$PREJ" ]; then die "导入前目录检查失败：没有拿到路径 JSON"; fi
+if [ -n "$MISSING" ]; then
+  printf '%s\n' "将被 config 导入自动创建、当前不存在的目录：$MISSING"
+  say "pre_json：$PREJ"
+  die "存在会被 backend.config 导入自动 mkdir 的目录（$MISSING）。按设计停止：不导入、不创建任何目录。请先确认这些挂载/目录是否正常，再重跑。"
+fi
+say "pre_import_dirs OK（DATA_DIR/CONFIG_DIR/LOG_DIR/BACKUP_DIR/SUB_DIR 均存在，导入不会产生目录副作用）"
+
+# 2.2 导入 config 取权威路径
 PATHS=$(RUN python -c "
 import json,os
 from pathlib import Path
-# 先用环境变量推出应有路径（不导入、零副作用），并检查这些目录是否已存在
-envd=os.getenv('NODEPOOL_DATA_DIR','./data')
-pre={'data':str(Path(envd).resolve()),
-     'db':str(Path(os.getenv('NODEPOOL_DB') or (Path(envd)/'nodepool.db')).resolve()),
-     'backup':str(Path(os.getenv('NODEPOOL_BACKUP_DIR') or (Path(envd)/'backup')).resolve()),
-     'config':str(Path(os.getenv('NODEPOOL_CONFIG_DIR') or (Path(envd)/'config')).resolve()),
-     'logs':str(Path(os.getenv('NODEPOOL_LOG_DIR') or (Path(envd)/'logs')).resolve()),
-     'state':str(Path(os.getenv('NODEPOOL_STATE_DIR') or (Path(envd)/'state')).resolve())}
-for k,v in pre.items():
-    print('PRE_%s %s exists=%s'%(k,v,Path(v).exists()))
-print('IMPORT_MKDIR_RISK', [v for k,v in pre.items() if k!='state' and not Path(v).exists()])
-print('STATE_DIR_AUTOCREATE false（config.py 不管理 state 目录）')
-# 导入 config 取权威值（注意：config.py 导入时会 mkdir 上面 5 个目录，已存在则 no-op）
 import backend.config as c
 d={'app_version':c.VERSION,'data_dir':str(c.DATA_DIR),'config_dir':str(c.CONFIG_DIR),
    'db_path':str(c.DB_PATH),'backup_dir':str(c.BACKUP_DIR),'log_dir':str(c.LOG_DIR),
    'state_dir_env':os.getenv('NODEPOOL_STATE_DIR','')}
 d['state_dir']=d['state_dir_env'] or str(Path(d['data_dir'])/'state')
-mm=[]
-for k,v in (('data',d['data_dir']),('db',d['db_path']),('backup',d['backup_dir']),
-            ('config',d['config_dir']),('logs',d['log_dir']),('state',d['state_dir'])):
-    if str(Path(v).resolve()) != pre[k]: mm.append((k,pre[k],v))
-print('PATH_MISMATCH', mm)
 print('PATHS_JSON '+json.dumps(d))
 " 2>&1) || true
 
 PJ=$(printf '%s\n' "$PATHS" | grep '^PATHS_JSON ' | sed 's/^PATHS_JSON //')
 printf '%s\n' "$PATHS" | grep -v '^PATHS_JSON ' | grep . | sed 's/^/[config] /'
-if [ -z "$PJ" ]; then die "容器内 import backend.config 失败：拿不到权威路径（见上面 stderr）"; fi
+if [ -z "$PJ" ]; then die "容器内 import backend.config 失败：拿不到权威路径（见上面 [config] 输出）"; fi
 
 getjson() { printf '%s' "$PJ" | sed -n "s/.*\"$1\": \"\([^\"]*\)\".*/\1/p"; }
 CFG=$(getjson config_dir); CDATA=$(getjson data_dir); CDB=$(getjson db_path)
 CBK=$(getjson backup_dir); CST=$(getjson state_dir); AVER=$(getjson app_version)
 SENV=$(getjson state_dir_env)
 [ -n "$CDB" ] && [ -n "$CBK" ] && [ -n "$CST" ] && [ -n "$CDATA" ] || die "关键路径解析不完整（db='$CDB' backup='$CBK' state='$CST' data='$CDATA'）"
+
+# 2.3 导入值 vs 预检查值 一致性
+PRE_JSON=$(printf '%s' "$PREJ")
+for pair in "DATA_DIR:$CDATA" "DB_PATH:$CDB" "BACKUP_DIR:$CBK" "CONFIG_DIR:$CFG" "STATE_DIR:$CST"; do
+  k=${pair%%:*}; v=${pair#*:}
+  pv=$(printf '%s' "$PRE_JSON" | sed -n "s/.*\"$k\": \"\([^\"]*\)\".*/\1/p")
+  if [ -n "$pv" ] && [ "$pv" != "$v" ]; then die "路径不一致：$k 预检查=$pv 导入值=$v（配置与环境冲突，停止）"; fi
+done
 say "app_version       $AVER"
 say "container_data    $CDATA"
 say "container_db      $CDB"
@@ -289,30 +309,81 @@ elif [ "$HSTATE_EXISTS" != "yes" ]; then
   P7_STATE="未执行（STATE_DIR 未确认/不存在，按设计不创建目录）"; say "SKIPPED: $P7_STATE"
   say "如确认可创建：先手工 mkdir -p $HST，再重跑本段"
 else
-  P7_STATE="已执行"
-  RUN env NP_STATE="$CST" python - <<'PY'
+  P7_STATE="已执行（进行中）"
+  P7_OUT=$(RUN env NP_STATE="$CST" NP_FAULT="${NODEPOOL_P7_FAULT:-}" python - <<'PY'
 import json, os, uuid
 from pathlib import Path
 SD = Path(os.environ["NP_STATE"])
+FAULT = os.environ.get("NP_FAULT") or ""
 print("state_dir", SD, "exists", SD.exists(), "os_access_W", os.access(SD, os.W_OK))
 if not SD.exists():
-    print("VERDICT", "STATE_DIR_MISSING -> 不创建、不写入"); raise SystemExit(1)
-n=uuid.uuid4().hex[:8]; t=SD/f"p1probe.{n}.tmp"; tgt=SD/f"p1probe.{n}.json"
+    print("VERDICT", "FAILED STATE_DIR_MISSING")
+    raise SystemExit(3)
+n = uuid.uuid4().hex[:8]
+t   = SD / f"p1probe.{n}.tmp"
+tgt = SD / f"p1probe.{n}.json"
+steps = {}
+cur = "init"
 try:
-    with open(t,"wb") as f:
-        f.write(b'{"probe":true}'); f.flush(); os.fsync(f.fileno())
-    print("step write+file_fsync OK")
-    os.replace(str(t), str(tgt)); print("step os.replace OK")
-    dfd=os.open(str(SD), os.O_RDONLY|os.O_DIRECTORY); os.fsync(dfd); os.close(dfd); print("step dir_fsync OK")
-    print("step readback", json.loads(tgt.read_text(encoding="utf-8")))
-    tgt.unlink(); dfd=os.open(str(SD), os.O_RDONLY|os.O_DIRECTORY); os.fsync(dfd); os.close(dfd)
-    print("step unlink+dir_fsync OK")
-    print("VERDICT", "ATOMIC_WRITE_SUPPORTED")
+    cur = "write_tmp_flush_fsync"
+    if FAULT == "write": raise OSError("injected_fault:write")
+    with open(t, "wb") as f:
+        f.write(b'{"probe":true}')
+        f.flush()
+        os.fsync(f.fileno())
+    steps[cur] = True; print("step1 write+flush+file_fsync OK")
+
+    cur = "os_replace"
+    if FAULT == "replace": raise OSError("injected_fault:replace")
+    os.replace(str(t), str(tgt))
+    steps[cur] = True; print("step2 os.replace OK")
+
+    cur = "dir_fsync"
+    if FAULT == "dirfsync": raise OSError("injected_fault:dirfsync")
+    dfd = os.open(str(SD), os.O_RDONLY | os.O_DIRECTORY)
+    os.fsync(dfd); os.close(dfd)
+    steps[cur] = True; print("step3 dir_fsync OK")
+
+    cur = "readback"
+    if FAULT == "readback": raise ValueError("injected_fault:readback")
+    data = json.loads(tgt.read_text(encoding="utf-8"))
+    if data != {"probe": True}: raise ValueError("readback_mismatch %r" % (data,))
+    steps[cur] = True; print("step4 readback OK", data)
+
+    cur = "unlink_testfile"
+    if FAULT == "unlink": raise OSError("injected_fault:unlink")
+    tgt.unlink()
+    steps[cur] = True; print("step5 unlink OK")
+
+    cur = "dir_fsync_after_unlink"
+    if FAULT == "dirfsync2": raise OSError("injected_fault:dirfsync2")
+    dfd = os.open(str(SD), os.O_RDONLY | os.O_DIRECTORY)
+    os.fsync(dfd); os.close(dfd)
+    steps[cur] = True; print("step6 dir_fsync(after unlink) OK")
+except Exception as e:
+    print("STEP_FAILED", cur, type(e).__name__, e)
 finally:
-    for q in (t,tgt):
-        try: q.unlink()
-        except FileNotFoundError: pass
+    # 只清理本次创建的两个文件（名字含本次 uuid），绝不碰其他文件
+    for q in (t, tgt):
+        try:
+            if q.exists():
+                q.unlink(); print("cleanup removed", q.name)
+        except OSError as e:
+            print("cleanup_failed", q.name, type(e).__name__, e)
+ok = len(steps) == 6 and not FAULT
+print("steps_completed", len(steps), sorted(steps))
+print("VERDICT", "ATOMIC_WRITE_SUPPORTED" if ok else "FAILED")
+raise SystemExit(0 if ok else 3)
 PY
+)
+  P7_RC=$?
+  printf '%s\n' "$P7_OUT" | sed 's/^/  /'
+  if [ "$P7_RC" -eq 0 ] && printf '%s\n' "$P7_OUT" | grep -q 'VERDICT ATOMIC_WRITE_SUPPORTED'; then
+    P7_STATE="已执行（通过：ATOMIC_WRITE_SUPPORTED）"
+  else
+    P7_STATE="已执行（失败：rc=$P7_RC，见 STEP_FAILED/VERDICT）"
+    SCRIPT_RC=3
+  fi
 fi
 
 # ---------------------------------------------------------------- 8) P-6 / P-8 / 卷
@@ -331,4 +402,6 @@ fi
 
 hr "DONE"
 say "P-7 状态：$P7_STATE"
+say "脚本退出码：$SCRIPT_RC（0=全部只读探针完成；2=目标不明已停止；3=P-7 执行失败）"
 say "请回贴本 log 全文；未确认项保持为空，不做估算。"
+exit "$SCRIPT_RC"
