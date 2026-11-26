@@ -2022,7 +2022,7 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 - 设计：不放宽 INACTIVE 检查，新增显式恢复分支 `import --file <备份> --recover --reason "<说明>"`；`ACTIVE` 仍拒绝（须先停容器），`RECOVERY_REQUIRED` 缺 `--recover`/`--reason` 拒绝。
 - 顺序：严格校验备份（未过校验前不写维护、不动目标库）→ 写恢复维护记录并确认 `ACTIVE` → 写封锁确认 → 排空 → 逐条关闭连接确认 → 文件级安全替换（preimport 含 WAL、句柄复核）→ 恢复后完整性/结构/逐表计数校验 → `schema_migrations` 必须不存在或全为 `success` → 才删维护文件、回读 `INACTIVE`、解封。
 - 失败：任一环节失败均保持维护文件与写封锁，状态仍 `RECOVERY_REQUIRED`，不自动开放写入；导入的备份若自身含 `running`/`failed` 行，拒绝解封（`recovery_backup_incomplete`）。
-- 验收：迁移事务内写行失败后恢复（R4-a，见实施计划 §8.5.5）、`docker kill` 中断后恢复（R4-b）、坏备份在恢复态仍拒绝且库不变、恢复过程异常时封锁保持。
+- 验收：迁移事务内写行失败后恢复（R4-a，含 `TX_ROLLED_BACK`+仅基线的 T2 提交前崩溃窗口，见实施计划 §8.5.5）、`docker kill` 中断后恢复（R4-b）、坏备份在恢复态仍拒绝且库不变、恢复过程异常时封锁保持。
 
 **迁移内容与源库状态（统一采用 B，不得自行扩展）**：源库为 v1.8.7 结构（`1.8.7-baseline`，`VERSION_SEQ=1`）：17 张基准业务表 + 可选 `tasks`；**`schema_migrations` 已存在且恰有一条基线成功行**（`migration_id/version='1.8.7-baseline'`、`seq=1`、`status='success'`）。该表与基线由测试环境的**预备步骤**调用 `record_baseline()`/`ensure_schema_table_transactional()` 创建；**迁移事务内零 DDL、不建表**，只插入 `running` 行（`seq=2, version='1.10'`），提交后置 `success`。目标版本 `1.10`（`VERSION_SEQ=2`），仅版本标记，无业务结构变更；前后 `structure_hash` 相同、业务表计数不变，`schema_migrations` 1→2 行。R1–R5 全部从同一 B 状态副本出发；A（表不存在、首次建基线）不在 P-1.8 范围，由 P-1.2/P-1.6 覆盖。当前 `migrate.run()` 仍是 P-1.6 空迁移框架（`dry_run=False` 拒绝、零 DDL），施工前须由项目方确认本节并补齐演练入口。
 
@@ -2034,27 +2034,36 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 - **D2**：启动中断分类——先按 §3.3 真实 `flock` 探测迁移锁：被持有 ⇒ 拒绝启动；锁空闲且维护文件 `maintenance=true` ⇒ 上一进程已死亡，按“最后落盘 phase + 实际 DB 行”判 `RECOVERY_REQUIRED`（详见下表）。
 - **D3**：重启即封锁——`RECOVERY_REQUIRED`/`ACTIVE` 时在 `init_db()`、调度器和 HTTP 监听之前封锁写入并确认，业务写 503。
 
-**phase 不代表数据库行集合**：真实顺序为 `BEGIN` → 持久化 `TX_OPEN` → `INSERT running`（未提交）→ 持久化 `COMMIT_ATTEMPTED` → `COMMIT` → 置 `success`。`COMMIT_ATTEMPTED` 与 `COMMIT` 之间可被 SIGKILL，崩溃回滚使 DB 仅剩基线行。因此重启必须只读 DB，按四种实际结果判定：
+**phase 不代表数据库行集合**：真实顺序为 `BEGIN` → 持久化 `TX_OPEN` → `INSERT running`（未提交）→ 持久化 `COMMIT_ATTEMPTED` → `COMMIT` → 置 `success`。`COMMIT_ATTEMPTED` 与 `COMMIT` 之间可被 SIGKILL，崩溃回滚使 DB 仅剩基线行。因此重启必须只读 DB，按四类行集合 + 兜底组合判定：
 
 | 实际 DB 行集合 | 最后 phase | 判定 |
 | --- | --- | --- |
-| 仅基线 | `PREPARED` / `TX_OPEN` / `COMMIT_ATTEMPTED` | `RECOVERY_REQUIRED`（`interrupted_before_tx` / `interrupted_in_tx` / `commit_not_applied_or_rolled_back`） |
+| 仅基线 | `PREPARED` / `TX_OPEN` / `TX_ROLLED_BACK` / `COMMIT_ATTEMPTED` | `RECOVERY_REQUIRED`（`interrupted_before_tx` / `interrupted_in_tx` / `rolled_back_without_failed_row` / `commit_not_applied_or_rolled_back`） |
 | 基线 + `running` | `COMMIT_ATTEMPTED` | `RECOVERY_REQUIRED`（`committed_not_finalized`）；禁止重跑迁移 |
 | 基线 + `success` | `COMMIT_ATTEMPTED` / `COMMITTED` | `RECOVERY_REQUIRED`（`success_pending_release`）；人工确认后按成功收尾 |
 | 基线 + `failed` | `TX_OPEN` / `COMMIT_ATTEMPTED` / `TX_ROLLED_BACK` | `RECOVERY_REQUIRED`（`migration_failed`）；走 `import --recover` |
+| 其他任意组合 | 任意 | `RECOVERY_REQUIRED`（`unclassified_state`）；保守封锁，禁止自动解封 |
 
-锁被持有 ⇒ 拒绝启动（`already_running`）；维护文件缺失但 DB 有 `running`/`failed` ⇒ `RECOVERY_REQUIRED`。R4-b 必须用真实 SIGKILL + 维护文件/DB/CLI 三份外部证据断言，禁止 mock；D1–D3 未批准前 R3/R4-b 不得标记通过。
+锁被持有 ⇒ 拒绝启动（`already_running`）；维护文件缺失但 DB 有 `running`/`failed` ⇒ `RECOVERY_REQUIRED`。`TX_ROLLED_BACK` 不代表 `failed` 行已写入：T2 失败或崩溃时 DB 仅基线，仍必须 `RECOVERY_REQUIRED`。R4-b 必须用真实 SIGKILL + 维护文件/DB/CLI 三份外部证据断言，禁止 mock；D1–D3 未批准前 R3/R4-b 不得标记通过。
 
-**D2 迁移锁协议**：
+**D2 进程生命周期锁协议（选择 B：同一 `STATE_DIR` 只允许一个应用实例）**：
+
+选择理由：单容器单 `uvicorn` 进程（未启用 `--workers`），调度器、维护态判定与写封锁均在同进程；`maintenance.json`/锁/故障日志以 `STATE_DIR` 为唯一事实源；SQLite 单写者不适配多副本。因此锁不限于迁移窗口，覆盖整个应用进程生命周期。
 
 | 项 | 设计 |
 | --- | --- |
-| 路径/类型 | `<STATE_DIR>/migration.lock`；`open(O_RDWR|O_CREAT, 0600)` + `fcntl.flock(LOCK_EX|LOCK_NB)` |
-| 持有者 | 执行 `migrate.run()` 的进程；启动分类由新进程自身持同一把锁判定 |
-| 生命周期 | `BEGIN` 前获取，迁移结束/halt/进程终止释放；分类判 `RECOVERY_REQUIRED` 则持锁到退出，判 `INACTIVE` 才释放，迁移入口重新获取并双检 |
-| 原子判定/竞态 | 仅以 `flock` 成功=空闲、`EWOULDBLOCK`=被持有；禁止看文件存在/PID/mtime；分类与启动在同一持锁区间，第二个实例直接拒绝启动 |
-| SIGKILL/残留 | 内核关闭 fd 自动释放；文件保留但无锁属正常；不删除、不截断、不重命名锁文件 |
-| 多实例/不支持 | 仅一个获取成功，其余 `already_running` 退出码 2；`ENOLCK`/`EOPNOTSUPP` ⇒ `migration_lock_unsupported`，fail-closed |
+| 路径/类型 | `<STATE_DIR>/migration.lock`；`os.open(O_RDWR|O_CREAT|O_CLOEXEC, 0600)` + `fcntl.flock(LOCK_EX|LOCK_NB)` |
+| 获取者/时点 | 应用进程启动引导，早于 `init_db()` 与端口监听；独立 CLI 的 `run`/`import` 在命令开始时获取 |
+| 生命周期 | 持有到进程退出/命令结束；正常关闭 `LOCK_UN` + `close`；**分类完成后不释放** |
+| 迁移复用 | 应用进程以 `InstanceLock` 单例保存 fd；`migrate.run()` 只校验并使用该锁令牌，**不得再次 `flock` 同一路径**（同进程新 fd 会与自身冲突） |
+| 第二实例 | `EWOULDBLOCK` ⇒ `already_running`，退出码 2；不绑定端口、不初始化 DB、不服务 |
+| 独立 CLI | `run`/`import` 自行获取锁；应用在运行则拒绝，必须先停应用。P-1.8 导入步骤即“停应用 → CLI 导入” |
+| 原子判定/竞态 | 只认 `flock` 成功=空闲、`EWOULDBLOCK`=被持有；禁止文件存在/PID/mtime；获取早于端口与 DB，无检查-获取窗口 |
+| SIGKILL/残留 | 内核关闭 fd 自动释放；文件保留但无锁正常；永不删除/截断/重命名锁文件 |
+| FD 继承 | `O_CLOEXEC` 防 exec 继承；`subprocess` 用 `close_fds=True`；`fork` 子进程入口立即 `close(fd)` 或改用 `spawn`；锁 fd 不得传给测试/速度测试子进程 |
+| 不支持 | `ENOLCK`/`EOPNOTSUPP` ⇒ `migration_lock_unsupported`，fail-closed，拒绝启动或禁用迁移/导入入口 |
+| 部署约束 | 同一 `DATA_DIR` 必须对应同一 `STATE_DIR`；禁止两个实例用不同 `STATE_DIR` 指向同一数据库 |
+
 
 **前置条件**：P-1.7 已验收（`a62aeb2`）；P-1.3–P-1.6 回归全绿；独立 bridge 网络、独立端口 8089、独立 bind 目录与 `STATE_DIR`、禁用自动重启；测试库为离线副本或同构合成库，禁止挂载生产目录；仅在测试目录验证 `os.replace`/`fsync`；记录镜像 digest 与 `config.VERSION`。
 
@@ -2066,4 +2075,4 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 
 **与 P-1.7 的关系**：P-1.7 的备份/导入/维护保护是本阶段的被验证对象，不因本阶段改写；P-1.8 不新增自动恢复机制，回滚一律走 `cli import` 手动路径。
 
-**v1.10 到此结束。** 二十三次修订合计**未编写代码、未执行迁移、未修改数据库、未修改生产配置或生产数据**；前十九次修订累计只处理"五项 + 两项 + 三项 + S2 异常保护 + 路径与关闭接口一致性 + β′ 跨重启证据 + 证据写入路径 + 证据完整性 + 提交结果确认 + 转换级分派与 phase 落地窗口 + halt 上行传递 + C 类不降级与 halt 故障安全 + 语义统一与 maintenance 持久化一致性 + 裸 bool 清理、维护态单一来源与自检去 assert + 维护态读取者职责分离 + 维护态三态判定在统一入口闭环、判定与写入确认分离 + 维护文件读取分类四态化（缺失/损坏/不可读严格区分）+ false 分支结构校验前置、since 有限正数严格化、since 整数/浮点分治（超大整数不触发 OverflowError、结构检查不抛出）"的状态机与伪代码矛盾；第 20 次修订改 P-1.8 阶段定义（生产窗口 → Docker 迁移演练与交付验证，见 §12）；第 21 次修订补 R4 授权恢复路径、迁移内容定义、计时口径与生产表述清理；第 22 次修订明确源库统一为 B 状态（迁移事务零 DDL）、新增 `docker kill` 持久证据缺口与 D1–D3 设计补充；第 23 次修订修正 `COMMIT_ATTEMPTED` 不得推断 `running` 行、重启按 DB 四类实际结果判定、SIGKILL 不写 `UNKNOWN`、R4-a 改为零 DDL 写行失败、补全 D2 `flock` 锁协议，不涉及代码与 P-1.7 已验收内容。**C11–C20 全部未确认，C12 仍未被本轮视为已批准。** 文档交回总体设计最终审查；未获批准前不提交 P-1 实施计划、不进入任何实施阶段。
+**v1.10 到此结束。** 二十四次修订合计**未编写代码、未执行迁移、未修改数据库、未修改生产配置或生产数据**；前十九次修订累计只处理"五项 + 两项 + 三项 + S2 异常保护 + 路径与关闭接口一致性 + β′ 跨重启证据 + 证据写入路径 + 证据完整性 + 提交结果确认 + 转换级分派与 phase 落地窗口 + halt 上行传递 + C 类不降级与 halt 故障安全 + 语义统一与 maintenance 持久化一致性 + 裸 bool 清理、维护态单一来源与自检去 assert + 维护态读取者职责分离 + 维护态三态判定在统一入口闭环、判定与写入确认分离 + 维护文件读取分类四态化（缺失/损坏/不可读严格区分）+ false 分支结构校验前置、since 有限正数严格化、since 整数/浮点分治（超大整数不触发 OverflowError、结构检查不抛出）"的状态机与伪代码矛盾；第 20 次修订改 P-1.8 阶段定义（生产窗口 → Docker 迁移演练与交付验证，见 §12）；第 21 次修订补 R4 授权恢复路径、迁移内容定义、计时口径与生产表述清理；第 22 次修订明确源库统一为 B 状态（迁移事务零 DDL）、新增 `docker kill` 持久证据缺口与 D1–D3 设计补充；第 23 次修订修正 `COMMIT_ATTEMPTED` 不得推断 `running` 行、重启按 DB 四类实际结果判定、SIGKILL 不写 `UNKNOWN`、R4-a 改为零 DDL 写行失败、补全 D2 `flock` 锁协议；第 24 次修订补 R4-a 的 T1/T2 事务边界与 `TX_ROLLED_BACK`+仅基线崩溃窗口、D2 明确选择 B（`STATE_DIR` 单应用实例、进程生命周期锁、迁移锁令牌复用、FD 继承防护），不涉及代码与 P-1.7 已验收内容。**C11–C20 全部未确认，C12 仍未被本轮视为已批准。** 文档交回总体设计最终审查；未获批准前不提交 P-1 实施计划、不进入任何实施阶段。

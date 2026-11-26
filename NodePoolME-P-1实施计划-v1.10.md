@@ -647,8 +647,8 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 | --- | --- | --- | --- | --- |
 | F1 | 手动导出失败（空间/IO/校验不过） | 删除临时文件、非零退出且不改库 | 业务不受影响 | 换目录/清理空间后重导 |
 | F2 | 导出后校验失败 | 不落名、删临时文件 | 业务不受影响 | 重新导出；持续失败查磁盘/库 |
-| F3 | `schema_migrations` 写 `running` 失败 | 事务已回滚，只读确认**无** `running`/`failed` 行残留 | 可返回原状（服务可写） | 直接重启；若复查发现残留行 ⇒ 立即降级为 F4 |
-| F4 | DDL 执行抛错 | 事务 ROLLBACK → 判 `KNOWN_FAILED` → 标 `failed` | **写入封锁**：`failed` ⇒ `migration_incomplete()`=True ⇒ `RECOVERY_REQUIRED`（503） | 运维手动 `import --file <迁移前导出>` → 复核 → 自动清维护 → 重启 → 只读复核 → 才解封（无自动恢复链） |
+| F3 | `schema_migrations` 写 `running` 失败（T1） | 回滚确认后持久化 `TX_ROLLED_BACK`，再由 T2 写 `failed` | `failed` 写成功 ⇒ `RECOVERY_REQUIRED`；写失败 ⇒ 仅基线 + `TX_ROLLED_BACK` 仍 `RECOVERY_REQUIRED`；均不自动解封 | `import --recover --file <迁移前备份>` → 复核 → 重启 |
+| F4 | T2 写 `failed` 行失败/崩溃 | 保持 `TX_ROLLED_BACK`、维护与封锁；进程 halt | 仅基线（phase `TX_ROLLED_BACK`）⇒ `RECOVERY_REQUIRED`（503） | `import --recover --file <迁移前导出>` → 复核 → 清维护 → 重启 → 只读复核；无自动恢复链 |
 | F5 | 提交结果不确定 | 判 `OUTCOME_UNKNOWN` → `halt_migration("commit_outcome_unknown")` | 写入封锁 | 只读比对表结构与 `schema_migrations` → 人工决策（P-1 无事件表可重查） |
 | F6 | `set_maintenance` 失败 | 继续封锁 → `fatal_exit("maintenance_unconfirmed")` | 进程退出，写入已被挡 | 修复后重启，走 `RECOVERY_REQUIRED` |
 | F7 | 写入封锁无法确认 | `fatal_lockdown` + `fatal_exit("writes_block_unconfirmed")` | 进程退出 | 停容器（`docker stop`）后离线恢复 |
@@ -744,7 +744,7 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 
 | 编号 | 场景 | 断言 |
 | --- | --- | --- |
-| R4-a | 迁移事务内写行失败（零 DDL） | 见 §8.5.5：测试夹具使 `INSERT running` 抛错 ⇒ `ROLLBACK` 确认 ⇒ 无 running 行、写 `failed` 行 ⇒ 重启后 `RECOVERY_REQUIRED`；`import --recover` 迁移前 B 备份 → 成功 → `INACTIVE` |
+| R4-a | 迁移事务内写行失败（零 DDL） | 见 §8.5.5：测试夹具使 `INSERT running` 抛错 ⇒ `ROLLBACK` 确认 ⇒ `TX_ROLLED_BACK` 落盘 ⇒ T2 写 `failed`；覆盖 T2 提交前 SIGKILL（DB 仅基线、phase `TX_ROLLED_BACK`）⇒ `RECOVERY_REQUIRED`；`import --recover` 迁移前 B 备份 → `INACTIVE` |
 | R4-b | `docker kill` 中断 | 见 §8.5.4：`TX_OPEN` 或 `COMMIT_ATTEMPTED` 时点真实 SIGKILL ⇒ 重启读实际 DB，按 §8.5.3 判定 `RECOVERY_REQUIRED`；`import --recover` 恢复成功；无自动恢复痕迹 |
 | R4-c | 坏备份 | 恢复态下用截断/元信息篡改备份 ⇒ 退出码 2、目标库计数与 sha 不变、状态仍 `RECOVERY_REQUIRED` |
 | R4-d | 恢复过程异常 | S3–S7 任一注入失败 ⇒ 维护文件仍在、`writes_blocked=True`、业务 503；重启后仍 `RECOVERY_REQUIRED` |
@@ -860,15 +860,18 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 | --- | --- | --- | --- | --- |
 | `PREPARED` | 空闲 | 仅基线 | `RECOVERY_REQUIRED`（`interrupted_before_tx`） | 事务前退出，无写入 |
 | `TX_OPEN` | 空闲 | 仅基线 | `RECOVERY_REQUIRED`（`interrupted_in_tx`） | 事务内崩溃，已回滚 |
+| `TX_ROLLED_BACK` | 空闲 | 仅基线 | `RECOVERY_REQUIRED`（`rolled_back_without_failed_row`） | T1 已回滚确认，但 `failed` 行未写、T2 未提交或崩溃；**不得**假设 failed 一定存在 |
 | `COMMIT_ATTEMPTED` | 空闲 | 仅基线 | `RECOVERY_REQUIRED`（`commit_not_applied_or_rolled_back`） | 提交前被杀或提交失败；**不得**因 phase 假设 running 存在 |
 | `COMMIT_ATTEMPTED` | 空闲 | 基线 + `running` | `RECOVERY_REQUIRED`（`committed_not_finalized`） | 已提交未收尾；禁止重跑迁移 |
 | `COMMIT_ATTEMPTED` / `COMMITTED` | 空闲 | 基线 + `success` | `RECOVERY_REQUIRED`（`success_pending_release`） | 迁移已完成，人工确认后按成功收尾，无需导入 |
-| `TX_OPEN` / `TX_ROLLED_BACK` / `COMMIT_ATTEMPTED` | 空闲 | 基线 + `failed` | `RECOVERY_REQUIRED`（`migration_failed`） | 故障路径，走 `import --recover` |
+| `TX_OPEN` / `COMMIT_ATTEMPTED` | 空闲 | 基线 + `failed` | `RECOVERY_REQUIRED`（`migration_failed`） | 故障路径，走 `import --recover` |
+| `TX_ROLLED_BACK` | 空闲 | 基线 + `failed` | `RECOVERY_REQUIRED`（`migration_failed`） | T2 已提交 failed 行；走 `import --recover` |
 | `UNKNOWN` | 空闲 | 任意 | `RECOVERY_REQUIRED`（`outcome_unknown`） | 只能人工判定后导入 |
+| 其他任意组合 | 空闲 | 其他行集合 | `RECOVERY_REQUIRED`（`unclassified_state`） | 未定义即保守封锁，禁止自动解封 |
 | 任意（文件缺失） | 空闲 | `running`/`failed` 存在 | `RECOVERY_REQUIRED` | 既有 `judge_by_migration_rows()` 证据 |
 | 任意 | 被持有 | — | 拒绝启动（`already_running`） | 另一进程正在迁移，不得判失败 |
 
-> `COMMIT_ATTEMPTED` 对应**两种**行集合（仅基线 / 基线+running），所以判定必须读库，不能查表猜。
+> `COMMIT_ATTEMPTED` 对应**两种**行集合（仅基线 / 基线+running）；`TX_ROLLED_BACK` 也对应两种（仅基线 / 基线+failed）。判定必须读库，不能查表猜；任何未列组合一律 `RECOVERY_REQUIRED`。
 
 #### 8.5.4 R3/R4-b 真实测试方法（无 mock）
 
@@ -883,36 +886,75 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 4. `import --recover --file <迁移前 B 备份>` → `INACTIVE` → 17 表计数回 B → 重启只读复核。
 5. D1–D3 未实现时本项记“设计缺口待批准”，不得判通过。
 
-#### 8.5.5 R4-a 故障演练（零 DDL，与迁移实现一致）
+#### 8.5.5 R4-a 故障演练（零 DDL，含崩溃窗口）
 
-迁移事务零 DDL，因此**不得**注入 `ALTER`/非法 DDL。R4-a 改为当前实现真实存在的写失败：
+迁移事务零 DDL，因此**不得**注入 `ALTER`/非法 DDL。R4-a 使用当前实现真实存在的写失败，并覆盖两个事务之间的 SIGKILL 窗口。
 
-| 项 | 定义 |
-| --- | --- |
-| 故障注入点 | 迁移事务内第 3 步 `INSERT INTO schema_migrations (… status='running')` |
-| 注入方式 | 预备阶段在测试库安装**测试夹具触发器**：`CREATE TRIGGER p18_abort_running BEFORE INSERT ON schema_migrations WHEN NEW.status='running' BEGIN SELECT RAISE(ABORT,'p18_injected_failure'); END;`。仅存在于测试夹具，**不属于迁移设计、不属于业务 DDL、不进入交付物** |
-| 事务状态 | `BEGIN IMMEDIATE` 已成功；`INSERT` 抛 ABORT；进程执行 `ROLLBACK` 并只读复核结构未变 |
-| 数据库实际记录 | 无 `running` 行；`ROLLBACK` 后写 `failed` 行（`status='failed'`, `version='1.10'`）；17 表计数不变 |
-| `RECOVERY_REQUIRED` 产生条件 | 维护文件仍在（phase `TX_ROLLED_BACK` 或最后成功 phase）+ 锁空闲 + DB 存在 `failed` 行；重启按 §8.5.3 判 `migration_failed` |
-| 手动恢复路径 | `import --recover --file <R4-a 的迁移前 B 备份>` → 严格校验 → 替换 → 复核（`schema_migrations` 仅基线 success）→ 清维护 → 解封 → 重启只读复核 |
-| 断言 | 恢复后 `current_version='1.8.7-baseline'`；无 failed/running；17 表计数与 B 备份一致 |
+**两个事务的连接与边界（代码事实）**：
 
-**设计缺口声明**：若项目方不接受测试夹具触发器，则零 DDL 迁移下不存在稳定的“事务内业务 DDL 失败”场景；纯环境故障（磁盘 ENOSPC/IO 错误）往往同时使 `failed` 行不可写，只能覆盖“halt + 人工导入”，不能覆盖“failed 行 → 授权恢复”。此时必须如实记录为设计缺口，不得编造测试结果。
+| 事务 | 连接 | 事务边界 | 说明 |
+| --- | --- | --- | --- |
+| T1（迁移事务） | 迁移入口 `open_connection(target)` | `BEGIN IMMEDIATE` → `INSERT running`（触发器 ABORT）→ 异常 → `ROLLBACK` → 独立只读复核 → 关闭迁移连接 | 回滚确认且结构未变后，才持久化 `TX_ROLLED_BACK`；未确认则保持 `TX_OPEN`，不得伪造 |
+| T2（失败标记） | `_mark_failed()` 内**另开** `open_connection` | `BEGIN IMMEDIATE` → `UPDATE running→failed`（0 行）→ `INSERT failed(seq=2, version='1.10')` → `COMMIT` → `close` | 与 T1 完全独立；`failed` 行可能**写不进去** |
 
-#### 8.5.6 D2 迁移锁协议
+**`TX_ROLLED_BACK` 落盘时点**：T1 `ROLLBACK` 成功、只读复核结构未变、迁移连接确认关闭之后，调用 D1 持久化；落盘成功后才进入 T2。落盘失败 ⇒ 不写 `failed` 行，保持最后成功 phase，进程 halt，维护与封锁保持。
+
+**成功路径的 DB 实际状态（T2 提交后）**：无 `running`；`schema_migrations` = 基线 success + `failed(1.10)`；17 表计数不变。
+
+**崩溃/失败窗口**：
+
+| 中断点 | 维护 phase | DB 实际记录 | 重启判定 |
+| --- | --- | --- | --- |
+| T1 `ROLLBACK` 后、`TX_ROLLED_BACK` 落盘前 SIGKILL | `TX_OPEN` | 仅基线 | `RECOVERY_REQUIRED`（`interrupted_in_tx`） |
+| `TX_ROLLED_BACK` 已落盘、T2 `BEGIN` 前 SIGKILL | `TX_ROLLED_BACK` | 仅基线 | `RECOVERY_REQUIRED`（`rolled_back_without_failed_row`） |
+| T2 已 `BEGIN`、`COMMIT` 前 SIGKILL | `TX_ROLLED_BACK` | 仅基线（T2 未提交被回滚） | 同上 |
+| T2 `COMMIT` 成功、进程退出/SIGKILL | `TX_ROLLED_BACK` | 基线 + `failed` | `RECOVERY_REQUIRED`（`migration_failed`） |
+| T2 抛错/写 failed 失败（进程存活） | `TX_ROLLED_BACK` | 仅基线 | 进程 `halt_migration("failed_row_unwritable")`；重启同上（`rolled_back_without_failed_row`） |
+| `TX_ROLLED_BACK` 落盘失败 | 保持 `TX_OPEN` | 仅基线 | `RECOVERY_REQUIRED`（`interrupted_in_tx`） |
+
+**T2 失败处理**：`_mark_failed()` 返回 `False` 时，禁止自动解封、禁止自动重试、禁止把 `TX_ROLLED_BACK` 改写成 success；维护文件与写封锁保持，进程以 `failed_row_unwritable` halt。运维只可按迁移前 B 备份执行 `import --recover`。
+
+**`RECOVERY_REQUIRED` 产生条件**：锁空闲（整个应用实例已退出）+ 维护文件仍在 + 实际 DB 为“仅基线（phase `TX_ROLLED_BACK`）”或“基线+failed”。前者不得因“没有 failed 行”判正常。
+
+**手动恢复路径**：`import --recover --file <R4-a 的迁移前 B 备份>` → 严格校验 → 替换 → 复核（`schema_migrations` 仅基线 success）→ 清维护 → 解封 → 重启只读复核。
+
+**R4-a 断言**：
+
+1. 正常运行：`failed_row_unwritable=false`，DB 有 `failed`，重启 `RECOVERY_REQUIRED`，备份恢复后 `INACTIVE`、无 failed/running、17 表计数回 B。
+2. 崩溃窗口：在 `TX_ROLLED_BACK` 落盘后、T2 提交前 `docker kill --signal=KILL`；重启必须见 phase `TX_ROLLED_BACK` + DB 仅基线，判 `RECOVERY_REQUIRED`，同样用 B 备份恢复成功。
+3. 全程无自动恢复、无自动重试、无自动解封。
+
+**设计缺口声明**：若项目方不接受测试夹具触发器，则零 DDL 迁移下不存在稳定的“业务语句失败”场景；纯环境故障（磁盘 ENOSPC/IO 错误）往往同时使 `failed` 行不可写，只能覆盖“halt + 人工导入”，不能覆盖“failed 行 → 授权恢复”。此时必须如实记录为设计缺口，不得编造测试结果。
+
+
+#### 8.5.6 D2 进程生命周期锁协议（选择 B）
+
+**边界选择：B —— 同一个 `STATE_DIR` 只能运行一个应用实例。**
+
+理由：
+
+1. NodePoolME 的部署模型是单容器、单 `uvicorn` 进程（`Dockerfile` 的 `CMD` 未使用 `--workers`），调度器、维护态判定与写封锁都在同一进程内，不存在多副本横向扩展需求。
+2. `maintenance.json`、`migration.lock` 与 `migration-fault.log` 都以 `STATE_DIR` 为唯一事实源；两个实例同时运行会让维护态、重启判定与 `K1_β`（“单实例锁已取得 ∧ 启动瞬间迁移连接表为空”）失去意义。
+3. SQLite 单写者 + 应用内调度器也不适合多实例并发写同一库。
+
+因此本协议**不只保证迁移期间互斥**，而是保证同一 `STATE_DIR` 整个应用进程单实例运行。所有会改库的入口（应用启动、`migrate.run()`、`import`）都必须在该锁保护下运行；独立 CLI 执行迁移/导入时，必须先停掉应用实例。
 
 | 项 | 设计 |
 | --- | --- |
 | 锁文件路径 | `<STATE_DIR>/migration.lock`（与维护文件同目录、同卷；`STATE_DIR` 独立于 `DATA_DIR`） |
-| 锁类型 | `open(O_RDWR|O_CREAT, 0600)` + `fcntl.flock(fd, LOCK_EX|LOCK_NB)`；POSIX `flock` 建议锁，进程退出/被 SIGKILL 时由内核自动释放 |
-| 获取者 | 唯一迁移执行者：执行 `migrate.run()` 的进程。启动分类阶段由**新进程自身**获取同一把锁用于判定，不另设锁 |
-| 持有生命周期 | 迁移入口在 `BEGIN` 之前获取；持有到迁移结束、halt 退出或进程终止；正常结束显式 `LOCK_UN` + `close`。启动分类获取后：判 `RECOVERY_REQUIRED` 则**继续持有**到进程退出（阻止任何迁移）；判 `INACTIVE` 才释放，迁移入口随后重新获取并再次校验 |
-| 原子判断 | 只以 `flock` 结果为准：成功 ⇒ 当前无其他持有者；`EWOULDBLOCK` ⇒ 被持有。**禁止**以锁文件存在、PID、`/proc`、mtime 判断 |
-| 避免检查-启动竞态 | 分类与后续启动在同一持锁区间完成：分类时已持锁，判 `INACTIVE` 后释放；任何迁移入口必须先获取锁、再读维护文件与 DB，双检通过才动库；第二个实例在启动分类处 `EWOULDBLOCK` ⇒ 拒绝启动 |
-| SIGKILL 后释放 | 内核关闭 fd 时自动释放；锁文件保留但无锁，属正常状态；下次 `open+flock` 成功即证明无持有者 |
-| 残留锁文件 | 不删除、不截断、不重命名锁文件（删除会造成不同 inode 上的两把锁）；文件存在但 `flock` 成功 ⇒ 视为空闲 |
-| 多实例同时启动 | 仅一个 `flock` 成功并继续启动；其余 `EWOULDBLOCK`，以 `already_running` 拒绝启动（退出码 2），不进入服务，避免双进程写同一库 |
-| 文件系统不支持 | `flock` 返回 `ENOLCK`/`EOPNOTSUPP` ⇒ fail-closed：报 `migration_lock_unsupported`，禁用迁移入口，不得退化为“看文件是否存在” |
+| 锁类型 | `os.open(path, O_RDWR|O_CREAT|O_CLOEXEC, 0o600)` + `fcntl.flock(fd, LOCK_EX|LOCK_NB)`；`flock` 建议锁由内核维护，进程终止（含 SIGKILL）自动释放 |
+| 获取者 | 每个应用进程在启动引导阶段、`init_db()` 与 HTTP 端口监听之前获取；独立 CLI 的 `run`/`import` 在命令开始时获取 |
+| 持有生命周期 | 从启动引导获取成功起，**持有到进程退出**；正常关闭时 `LOCK_UN` + `close`。不存在“启动分类完成后释放”的路径 |
+| 第二实例 | `flock` 返回 `EWOULDBLOCK` ⇒ 记录 `already_running`，退出码 2；**不绑定端口、不初始化 DB、不进入服务**，避免双进程写同一库 |
+| 迁移期间复用 | 应用进程持有的 fd 由 `InstanceLock` 单例保存；`migrate.run()` 只接收并校验该锁令牌（同进程、fd 仍打开、锁状态有效），**不得再次 `flock` 同一路径**。同一进程对新 fd 再次加锁会与自身锁冲突，必须禁止嵌套获取 |
+| 独立 CLI | `run`/`import` 进程自行获取同一把锁并持有到命令结束；若应用实例在运行则获取失败，必须先停应用（P-1.8 测试的导入步骤即“停应用 → CLI 导入”） |
+| 原子判断/竞态 | 只以 `flock` 返回值判断：成功=无持有者，`EWOULDBLOCK`=被持有。禁止以文件存在、PID、`/proc`、mtime 判断。获取发生在绑定端口与打开 DB 之前，不存在“检查后再获取”的窗口 |
+| SIGKILL 后释放 | 内核关闭该 fd 时自动释放；锁文件保留但已无锁，属正常状态；下一次 `flock` 成功即证明无持有者 |
+| 残留锁文件 | 永不删除、不截断、不重命名（删除会导致不同 inode 上的两把锁）；文件存在但 `flock` 成功 ⇒ 视为空闲 |
+| FD 继承 | `O_CLOEXEC` 保证 `exec` 后不继承；`subprocess` 使用 `close_fds=True`（默认）；任何 `fork` 子进程必须在子进程入口立即 `close(fd)`，或改用 `spawn`；禁止把锁 fd 传给测试子进程、速度测试子进程或任何后台任务 |
+| 文件系统不支持 | `flock` 返回 `ENOLCK`/`EOPNOTSUPP` ⇒ fail-closed：`migration_lock_unsupported`，拒绝启动或禁用迁移/导入入口，不得退化为“看文件是否存在” |
+| 数据安全边界 | 单实例锁只解决进程互斥，不替代写封锁：维护态仍由 `maintenance.json` + `gate`/`pool` 判定；锁被外部工具绕过时，DB 层与 503 仍是最后防线；同一 `DATA_DIR` 必须对应同一 `STATE_DIR`，禁止不同 `STATE_DIR` 指向同一库 |
+
 
 ---
 
@@ -961,6 +1003,8 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 ③ **P-4**（`integrity_check` 与 `journal_mode`）——决定库本身是否允许动手。
 
 **待补能力（本轮不改，登记备查）**：若 P-10 实测显示 `/healthz` 没有版本字段，则"健康端点自带版本"属能力缺口，记为待补（P-1 后的独立小改动，不进本轮范围）；在此之前基线版本只能靠 `config.VERSION` + image digest 三值确定，且**不得**对外声称已做四值核对。
+
+**P-1.8 第五轮修订（第 24 次修订，2026-11-26）**：① 补 R4-a 崩溃窗口——明确 T1/T2 的连接与事务边界、`TX_ROLLED_BACK` 落盘时点，以及“`TX_ROLLED_BACK` + 仅基线”判定（`rolled_back_without_failed_row`）；`failed` 行写失败保持封锁并走备份恢复；任何未定义 phase/行组合一律 `RECOVERY_REQUIRED`。② D2 明确选择 B（同一 `STATE_DIR` 只允许一个应用实例），锁由进程启动持有到退出，迁移复用锁令牌不得二次 `flock`，补 `O_CLOEXEC`/fork/exec 与第二实例拒绝行为。③ §7 F3/F4 同步为 T1/T2 独立失败路径。
 
 **P-1.8 第四轮修订（第 23 次修订，2026-11-26）**：① 承认 `COMMIT_ATTEMPTED` 位于 `INSERT running` 与 `COMMIT` 之间，SIGKILL 可使数据库仅剩基线行；重启一律读实际 DB，按“仅基线 / 基线+running / 基线+success / 基线+failed”分支判定，未释放维护即 `RECOVERY_REQUIRED`；② 明确 SIGKILL 不执行 halt、不写 `UNKNOWN`，`UNKNOWN` 仅在进程存活且落盘成功时成立，phase 落盘失败 fail-closed；③ R4-a 改为零 DDL 下真实 `INSERT running` 失败（测试夹具触发器），并声明夹具不被接受时的设计缺口；④ 补 D2 锁协议（`<STATE_DIR>/migration.lock`、`flock` 排他、持锁生命周期、原子判定、竞态、SIGKILL 释放、残留文件、多实例、`ENOLCK`）。全文清理 R4-a/R4-b 的“DDL 阶段失败/强杀”表述。
 
