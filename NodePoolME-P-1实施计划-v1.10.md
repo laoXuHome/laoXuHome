@@ -100,15 +100,23 @@
 | --- | --- | --- | --- | --- | --- |
 | P-1 | 库体量与页数 | 只读连接 Python 片段（§1.3 第 1 段） | `path`、`bytes`、`page_size`、`page_count`、`freelist_count` | `page_size*page_count` ≈ `bytes`（差值 < 1 页）；`bytes > 0` | **只读**（`mode=ro`） |
 | P-2 | SQLite 版本 | `python -c "import sqlite3;print(sqlite3.sqlite_version)"` | `sqlite_version` | ≥ 3.35.0（`ALTER TABLE`/触发器/`CHECK` 相关特性可用） | **只读** |
-| P-3 | 表集合与行数 | 同 P-1 片段 | 每表 `count(*)`、`triggers` 列表、`tasks` 是否存在 | 17 张基准表齐全；`tasks` 若存在应为 0 行 | **只读** |
+| P-3 | 表集合与行数 | 同 P-1 片段 | 每表 `count(*)`、`triggers` 列表、`tasks` 是否存在及行数 | 17 张基准表齐全；`tasks` 存在与否都合法（预期 0 行；非 0 只记录、**不阻迁移、不动它**） | **只读** |
 | P-4 | WAL/SHM 物理状态 | `ls -l /data/nodepool.db*`；只读 `PRAGMA journal_mode`、`PRAGMA integrity_check`、`PRAGMA foreign_key_check` | `journal_mode`、`-wal` 字节数、`-shm` 字节数、`integrity`、`fk_violations` | `journal_mode=wal`；`integrity=ok`；`fk_violations=0` | **只读**——**不执行 `wal_checkpoint`**（见 §1.3 注） |
 | P-5 | 句柄 / 锁 / 未提交事务（三项分开看） | ①`lsof -p <pid>` 或 `/proc/<pid>/fd` 扫描；②`fuser -v /data/nodepool.db`；③只读连接内 `PRAGMA data_version` 前后取值 | ①持 `nodepool.db*` 的进程数；②外部持有者列表；③`data_version` 是否变化 | ①除主进程外应无其他持有者；③同一连接两次读取 `data_version` 不变即"期间无其他连接提交写"——**只能证明"没有已提交的写入"，不能证明"没有未提交事务"** | ①②**只读**；③**只读**（`data_version` 是只读 PRAGMA） |
 | P-6 | 备份目录与空间 | `ls -lht /backup`、`du -sh /backup`、`df -h /backup /data` | 文件数、最新 mtime、`/backup` 占用、两处 `avail` | `avail ≥ 3× 库大小` 且 `≥ 2048 MB` | **只读** |
 | P-7 | `STATE_DIR` 原子写能力 | §1.3 第 5 段探针（**在最终实际使用的 `STATE_DIR` 上跑**） | `state_dir`、`db_st_dev`、`state_st_dev`、`fs_type`、各步骤结果 | 同卷（`st_dev` 相等）∧ 写入/文件 fsync/rename/目录 fsync/回读/删除/再目录 fsync 全通过 | **写操作**（64 字节探针文件 + 可能创建 `STATE_DIR` 目录），需用户明确批准；不触碰 `nodepool.db*` |
 | P-8 | 运行身份与权限 | `id`、`ls -ld /data /data/state /backup` | `uid/gid`、属主、权限位 | 主进程 uid 可写 `STATE_DIR` 与 `BACKUP_DIR` | **只读** |
 | P-9 | `sub_publish` 当前配置与最近发布 | 只读连接查 `settings`（§1.3 第 4 段） | `sub_publish_enabled`、`sub_publish_mode`、`sub_publish_time`、`sub_publish_interval_minutes`、`sub_publish_next_at`、`logs` 中最近一条含"发布/订阅"的记录时间 | 能取到上述五项；`next_at` 非空或按模式可推算 | **只读** |
-| P-10 | 镜像与运行版本 | `docker inspect`（镜像 tag + `RepoDigests`）、容器内 `python -c "import backend.config as c;print(c.VERSION)"`、`curl /healthz` | `image_tag`、`image_digest`、`app_version`、`healthz.version` | 三者一致（tag 指 `latest` 时以 digest 为准）；记入基线 | **只读** |
+| P-10 | 镜像与运行版本（四值） | ①`docker inspect nodepool --format '{{.Config.Image}}'`；②`docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' <image>`；③容器内 `python -c "import backend.config as c;print(c.VERSION)"`；④`curl -s localhost:8080/healthz` 并解析 `version` 字段（§1.3 第 0 段） | `image_tag`、`image_digest`、`app_version`、`healthz_version`、`healthz_raw` | 四值核对规则见下；若 `/healthz` 无版本字段 ⇒ 记 `healthz_version=ABSENT`，**降级为三值核对并标记为待补能力**，不得写成"四值已核对" | **只读** |
 
+> **P-10 四值核对规则（写死，避免"看起来一致"）**：
+> 1. `image_tag` 必须是**可解析到 digest 的引用**（`repo:tag`）；生产用 `latest`，则 tag 本身没有唯一性，**以 `image_digest` 为准**。
+> 2. `image_digest` = 运行容器实际使用的镜像 digest（`RepoDigests` 中与 `Config.Image` 同 repo 的那一条；若有多条且与容器 `Image` 的 `sha256:` 不一致 ⇒ 判为 `digest_ambiguous`，停止并人工确认）。
+> 3. `app_version` = 容器内 `config.VERSION`（读的是**镜像内代码**，不是宿主机仓库）。
+> 4. `healthz_version` = `/healthz` 响应里的版本字段（若有）。基准代码的 `/healthz` 只返回 `{"status":"ok"}` 之类的存活标记（见审查报告 B14），**很可能没有版本字段**——这正是必须实测而不能假设的原因。
+> 5. 判定：`app_version` 与 `image_tag` 的版本段一致（如 `1.8.7`）且 `image_digest` 与容器实际镜像一致 ⇒ 记 `baseline_verifiable=true`；`healthz_version` 存在时还必须与 `app_version` 相等。任一不等 ⇒ `baseline_unverifiable`，**禁止登记基线**。
+> 6. `healthz_version=ABSENT` 时：三值核对通过即可登记基线，同时在 §10 空白项里保留"`/healthz` 增加版本字段"为**待补能力**（属 P0 之后的能力增强，不在 P-1 范围）。**禁止**用 `image_tag` 文本去冒充"healthz 已返回版本"。
+>
 > P-5 的诚实边界：SQLite 没有对外的"未提交事务清单"接口。`lsof`/`fuser` 只能回答"谁打开了文件"，`PRAGMA data_version` 只能回答"别的连接有没有提交过写"，**都不能完整识别未提交事务**。因此 §2.7 的排空判据不依赖"证明没有未提交事务"，而是依赖"取得写锁成功 + `wal_checkpoint(TRUNCATE)` 返回 `(0,0,0)` + 连续两次探测"——这是**操作性判据**，不是事务级证明。
 
 ### 1.3 生产探针脚本（可直接复制执行）
@@ -124,7 +132,21 @@ docker inspect nodepool --format '{{range .Mounts}}{{.Source}} -> {{.Destination
 docker inspect nodepool --format '{{.Config.Image}}'
 docker inspect nodepool --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -E 'NODEPOOL_(DATA_DIR|STATE_DIR|DB|BACKUP_DIR)' || true
 docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$(docker inspect nodepool --format '{{.Config.Image}}')"
-docker exec nodepool python -c "import backend.config as c;print('app_version', c.VERSION)"
+docker exec nodepool python -c "import backend.config as c;print('app_version', c.VERSION, 'data_dir', c.DATA_DIR, 'db', c.DB_PATH)"
+# P-10 ④：/healthz 原样响应 + 版本字段提取（无该字段时明确记 ABSENT，不猜测）
+curl -s -o /tmp/hz.json -w 'healthz_http_code=%{http_code}\n' http://127.0.0.1:8080/healthz
+cat /tmp/hz.json; echo
+python3 - <<'PY'
+import json
+try:
+    d = json.load(open("/tmp/hz.json", encoding="utf-8"))
+except Exception as e:
+    print("healthz_version", "UNPARSEABLE", e); raise SystemExit
+v = d.get("version") if isinstance(d, dict) else None
+print("healthz_version", v if isinstance(v, str) and v else "ABSENT")
+print("healthz_keys", sorted(d.keys()) if isinstance(d, dict) else type(d).__name__)
+PY
+rm -f /tmp/hz.json   # 只在容器 /tmp 内清理，不触碰 /data
 
 # 1) P-1/P-3/P-4：库体量、表行数、WAL 与完整性（只读，不 checkpoint）
 docker exec nodepool python - <<'PY'
@@ -147,7 +169,22 @@ PY
 # 2) P-4：WAL/SHM 物理实体（只读）
 docker exec nodepool sh -c 'ls -l /data/nodepool.db* 2>/dev/null || true'
 
-# 3) P-5：句柄与外部持有者（只读；只说明"谁打开了文件"，不说明"有无未提交事务"）
+# 3) P-5：句柄 / 外部持有者 / data_version 双读（只读）
+#     data_version 必须在【同一个只读连接】上读两次，比较 before/after/changed
+docker exec nodepool python - <<'PY'
+import sqlite3, os, time
+from pathlib import Path
+p = Path(os.getenv("NODEPOOL_DB", "/data/nodepool.db"))
+c = sqlite3.connect(f"file:{p}?mode=ro", uri=True)   # 同一连接，不做 checkpoint
+before = c.execute("PRAGMA data_version").fetchone()[0]
+time.sleep(2)
+after  = c.execute("PRAGMA data_version").fetchone()[0]
+print("data_version_before", before)
+print("data_version_after ", after)
+print("data_version_changed", before != after)
+c.close()
+PY
+# 边界（必须保留）：只能判断"放到其他连接是否提交过写入"；不能证明不存在未提交事务
 docker exec nodepool sh -c 'for f in /proc/[0-9]*/fd/*; do t=$(readlink "$f" 2>/dev/null); case "$t" in */nodepool.db*) echo "$f -> $t";; esac; done' | head -30
 docker exec nodepool sh -c 'command -v fuser >/dev/null && fuser -v /data/nodepool.db 2>&1 || echo "fuser not installed"'
 
@@ -232,7 +269,8 @@ docker exec nodepool sh -c 'stat -f -c "state_fs=%T block=%s" /data; stat -f -c 
 | P-7 全链路 | 写入/文件 fsync/rename/目录 fsync/回读/删除/再 fsync 全 `OK` | 任一失败（如共享卷返回 `EINVAL`）⇒ `maint_fs_unsupported` ⇒ 拒绝迁移 |
 | `fs_type` | `ext4`/`xfs`/`btrfs`/本地 `overlayfs` | `nfs`/`cifs`/`fuse.*` ⇒ 同"拒绝迁移"，并在计划里记为已知限制 |
 | 备份盘余量 | ≥ 3× 库大小 且 ≥ 2 GB | 先清理/扩盘，否则不改 |
-| P-10 三值一致 | tag（或 digest）与实际 `app_version` 一致 | 不一致 ⇒ 不允许登记基线（§2.2） |
+| P-10 版本核对 | `app_version` 与 tag 版本段一致 ∧ `image_digest` 与容器实际镜像一致；`healthz_version` 存在时还须相等 | 不一致 ⇒ `baseline_unverifiable`，不允许登记基线（§2.2）；`healthz_version=ABSENT` ⇒ 三值通过即可登记，同时记入待补能力 |
+| P-5 `data_version_changed` | `false`（同一连接两次读一致） | `true` ⇒ 期间有其他连接提交过写，说明仍有活动写入方，必须先查明；**该结果不能反证"无未提交事务"** |
 
 ---
 
@@ -279,7 +317,11 @@ BACKUP_DIR/nodepool-YYYYMMDD-HHMMSS-<stage>/
 
 **做法**：
 
-1. 表结构（比 v1.10 的表多一个排序键 `seq`，语义不变、DDL 仍由 P-1 独占）：
+1. **谁建这张表（必须钉死）**：`schema_migrations` **不得**进入 `db.py` 的通用 `SCHEMA`，`init_db()` 永不创建它。建表、基线登记、数量校验三件事只能由迁移器在同一个 `BEGIN IMMEDIATE` 事务内完成。理由：一旦普通初始化提前建出空表，下一次迁移 preflight 会读到"表存在但 0 行"，按 §2.2.5 直接拒绝迁移——形成"启动即把迁移入口焊死"的死锁式流程。
+
+   启动顺序固定为：`selfcheck_state_dir()` → `maintenance_state()`（此时表不存在 ⇒ `migration_incomplete()`=`False`，与现状完全一致）→ `init_db()`（不建该表）→ 调度器。**迁移表只在 `run()`/`record_baseline()` 的入口事务里存在或不存在**，普通启动路径永远看不到它。
+
+2. 表结构（比 v1.10 的表多一个排序键 `seq`，语义不变、DDL 仍由 P-1 独占；DDL 常量放 `migrate.py` 的 `SCHEMA_MIGRATIONS_DDL`，**不放 `db.py` 的 `SCHEMA`**）：
 
 ```sql
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -297,11 +339,17 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 2. **排序规则**：`current_version()` = `SELECT version FROM schema_migrations WHERE status='success' ORDER BY seq DESC LIMIT 1`。
    **禁止** `MAX(version)`、禁止 `ORDER BY version`——字符串比较会把 `1.10` 排在 `1.9` 之前。`seq` 由版本注册表（代码内常量 `VERSION_SEQ = {"1.8.7-baseline": 1, "1.10": 2, …}`）唯一分配，禁止运行时自增猜测。
-3. **建表与基线必须同一事务**：`BEGIN IMMEDIATE` → `CREATE TABLE IF NOT EXISTS` → `INSERT` 基线行 → 校验 `SELECT count(*) == 1` → `COMMIT`；任一步异常 → `ROLLBACK`，因此**不存在"表在、基线缺"的状态**。若提交后发现表空（理论上不可达），按 §2.2.5 的 preflight 拒绝迁移。
+3. **建表与基线必须同一事务**：`BEGIN IMMEDIATE` → `CREATE TABLE IF NOT EXISTS` → `INSERT` 基线行 → `SELECT count(*)` 校验 `== 1` → `COMMIT`；任一步异常 → `ROLLBACK`，因此**不存在"表在、基线缺"的状态**（SQLite 的 DDL 在事务内可回滚，建表与插行同生共死）。
+   若提交后仍读到 0 行（理论上不可达，例如别人手工 `DELETE`），按 §2.2.5 的 preflight 拒绝迁移；这条拒绝是**兜底**，不是正常路径。
+   **不允许**任何"先 `init_db()` 建空表、下次启动再补基线"的两段式写法。
 4. **基线值必须与生产实际状态核对，不能凭仓库 commit 推断**：
-   - `version` 取 P-10 的实测值（镜像 digest + 容器内 `config.VERSION` + `/healthz` 三者一致）；
+   - `version` 取 P-10 的实测值：`config.VERSION` 与 tag 版本段一致、`image_digest` 与容器实际镜像一致（`/healthz` 若有版本字段还需相等；无该字段则记 `healthz_version=ABSENT`，按三值核对，见 §1.2.7 P-10 规则）；
    - `detail_json` 记录 `{"baseline":true,"app_version":…,"image_digest":…,"structure_hash":…,"tables":[…],"tasks_present":bool}`；
-   - `structure_hash` = 对 `sqlite_master` 中所有表/索引的 `sql` 规范化（按 name 排序、去空白）后 sha256；与代码内 `BASELINE_STRUCTURE_HASH` 比对，不一致 ⇒ **拒绝登记**并报 `baseline_structure_mismatch`。
+   - `structure_hash` 的取法与 `tasks` 的处理（旧版把 `tasks` 算进唯一摘要，会与"`tasks` 可选存在"直接冲突，本轮修正）：
+     * **主结构摘要**：对 `sqlite_master` 中除 `tasks` 及其索引/触发器之外的所有对象，按 name 排序、`sql` 去空白后拼串，取 sha256 ⇒ `structure_hash`。`tasks` 被**独立摘出**，不参与主摘要，因此"有 `tasks`"与"无 `tasks`"得到**同一个** `structure_hash`。
+     * **`tasks` 单独记账**：`detail_json` 记 `tasks_present: bool`、`tasks_rows: int`；若存在，再记 `tasks_hash`（只对该表定义取 sha256）。
+     * **合法结构双基准**：代码内保留 `BASELINE_STRUCTURE_HASH`（主摘要，不含 `tasks`）与两个合法 `tasks` 形态（`tasks_absent` / `tasks_empty_present`）。两者都算通过，只是记录不同；出现"`tasks` 存在但非空"或"主摘要不匹配"才拒绝。
+     * **红线**：`tasks` **永远保留**——不 `DROP`、不 `DELETE`、不 `ALTER`、不迁移、不重命名、不写入；`LEGACY_IGNORED` 只让它不参与主摘要与迁移范围，不影响其存在。
 5. **迁移器 preflight 判定矩阵**（运行前置检查，不改 `maintenance_state()` 的语义）：
 
 | 观测 | 结论 | 动作 |
@@ -309,13 +357,15 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 | 表不存在 | 迁移从未开始（对应 v1.10"表不存在 ⇒ `migration_incomplete()`=False"） | 建表 + 登记基线（同一事务） |
 | 表存在且 **0 行** | 异常：基线缺失 | **拒绝迁移** + `migration_table_empty`；维护态仍按 `migration_incomplete()`=False（v1.10 语义不改），但迁移入口关闭 |
 | 表存在，只有 `success` 行 | 正常 | 取 `seq` 最大者；`version` 与实测运行版本不一致 ⇒ 拒绝迁移 + 报 `version_mismatch` |
-| 表存在，存在 `running`/`failed` | 迁移未完成 | `migration_incomplete()`=True ⇒ `RECOVERY_REQUIRED`（v1.10 语义，不改） |
+| 表存在，存在 `running`/`failed` | 迁移未完成 | `migration_incomplete()`=True ⇒ `RECOVERY_REQUIRED`（v1.10 语义，不改）；**写入封锁，唯一解除路径见 §2.5.2-1** |
 
-6. `migration_incomplete()` 的实现口径**保持 v1.10 原样**：表不存在 ⇒ `False`；任一 `status <> 'success'` ⇒ `True`；查询异常 ⇒ 抛 `MaintUnverifiable`。本方案只增加"迁移器 preflight"这一层闸，不改变它的返回值。
+6. **表不存在时 `maintenance_state()` 的行为不变**：`ABSENT` 文件 → 查库 → `migration_incomplete()` 读到"表不存在" ⇒ `False` ⇒ `INACTIVE`。也就是说，**迁移从未开始时，维护判定与今天完全一致**，不会因为"没有这张表"而报错或误判。这条同时是修正 1 的正确性依据：把表推迟到迁移器创建，不改变任何既有判定路径。
 
-**触碰面**：`db.py` 的 `SCHEMA` 追加该表；新增 `migrate.py` 的 `VERSION_SEQ`、`current_version()`、`record_baseline()`、`preflight()`。
+7. `migration_incomplete()` 的实现口径**保持 v1.10 原样**：表不存在 ⇒ `False`；任一 `status <> 'success'` ⇒ `True`；查询异常 ⇒ 抛 `MaintUnverifiable`。本方案只增加"迁移器 preflight"这一层闸，不改变它的返回值。
 
-**判据**：PT-06/PT-06b/PT-06c 通过（幂等、原子性、`1.10` 与 `1.9` 排序正确）；15 张业务表结构与行数零变化。
+**触碰面**：`db.py` 的 `SCHEMA` **不改**（只加 `table_exists()`、`close_all_connections()` 等函数）；新增 `migrate.py` 的 `SCHEMA_MIGRATIONS_DDL`、`VERSION_SEQ`、`ensure_schema_table_transactional()`、`current_version()`、`record_baseline()`、`preflight()`。
+
+**判据**：PT-06/PT-06b/PT-06c/PT-06d 通过（幂等、原子性、`1.10` 与 `1.9` 排序正确、双合法结构）；17 张业务表结构与行数零变化；**PT-06e**：全新副本库先跑 `init_db()` 三次，断言 `schema_migrations` 不存在，再执行 `preflight()` 一次即建成且基线 1 行（证明无"先建空表"路径）。
 
 **回滚**：`DROP TABLE schema_migrations`（仅此表由 P-1 创建）。
 
@@ -388,7 +438,10 @@ v1.10 的完整事件链依赖 `system_events` / `migration_tx_notes` / 哈希�
 
 #### 2.5.2 失败分流与回滚
 
-1. `KNOWN_FAILED`（事务已 ROLLBACK，能只读确认表结构未变）⇒ 标记 `schema_migrations.status='failed'`、`detail_json` 记原因，恢复快照（若已动过表），清维护态（人工确认），重启。
+1. `KNOWN_FAILED`（事务已 ROLLBACK，能只读确认表结构未变）⇒ 标记 `schema_migrations.status='failed'`、`detail_json` 记原因。**注意：一旦 `failed` 落库，`migration_incomplete()` 即为 `True`（v1.10 语义：任一 `status <> 'success'` ⇒ True），`maintenance_state()` 因此返回 `RECOVERY_REQUIRED`，写入保持封锁。**
+   - 业务**不得**在 `failed` 状态下继续可写；即使"确认事务已回滚、表结构未变"，也只是"损坏范围可控"，不是"可以解封"。
+   - P-1 唯一受支持的解除路径：恢复 `pre-migrate` 备份集（该快照产生于写 `running` **之前**，因此天然不含这一行 `failed`）→ L1/L2 校验 → 人工确认 → 删 `maintenance.json` → 重启 → 只读复核 → 才允许写入。
+   - **不提供**"手工把 `failed` 改成 `success`"的 CLI 或自动改写；需要保留现场供分析时，就一直停在 `RECOVERY_REQUIRED`（只读 + 503），不牺牲正确性换取可用性。
 2. `OUTCOME_UNKNOWN`（`COMMIT` 已发出但结果不明）⇒ **不重试、不重放**，直接 `halt_migration("commit_outcome_unknown")`：写 maintenance + 封锁写入 + 非 DB 日志；`halt_tail` 显式校验 `maintenance_ok ∧ writes_blocked`，否则 `fatal_lockdown + fatal_exit`。
 3. 回滚动作顺序（严格）：停写 → 排空 → 关闭全部连接（不止线程本地）→ 用 `pre-migrate` 备份集恢复到同路径（原子替换 + 处理 `-wal`/`-shm`）→ L1/L2 校验 → 人工确认后清 `maintenance.json` → 重启 → 只读复核 → 允许写入。
 4. **禁止**：迁移中途"再试一次"；halt 中追加任何数据库写入；`DROP` 任何业务表；用 `VACUUM` 代替恢复；把"确认未提交"当成"提交成功"。
@@ -470,7 +523,7 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 
 | 文件 | 改动性质 | 内容 |
 | --- | --- | --- |
-| `backend/database/db.py` | 修改（增量） | `SCHEMA` 追加 `schema_migrations`（带 `seq`）；新增 `connect_readonly()`、`table_exists()`、`close_all_connections()`（关闭全部线程连接，供恢复/迁移使用） |
+| `backend/database/db.py` | 修改（增量，**不动 `SCHEMA`**） | 新增 `connect_readonly()`、`table_exists()`、`close_all_connections()`（关闭全部线程连接，供恢复/迁移使用） |
 | `backend/config.py` | 修改（增量） | 新增 `STATE_DIR`（默认 `DATA_DIR/state`）、备份/迁移相关配置项 |
 | `backend/database/maint.py` | 新增 | `MAINT_FILE`、`MaintState`/`MaintRead`、`read_maint_file()`、`maintenance_state()`、`set_maintenance()`、`confirm_maint_write()`、`migration_incomplete()`、`selfcheck_state_dir()` |
 | `backend/database/backup.py` | 新增 | `snapshot_set()`（备份集三件套 + 原子发布）、`verify_set()`（L1/L2）、`restore_set()`（安全恢复全流程）、`prune()` |
@@ -488,7 +541,7 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 | --- | --- |
 | 17 张基准表 | **零 DDL 改动**，只读/校验 |
 | `tasks`（遗留） | 登记、保留、不动；迁移 `LEGACY_IGNORED` 显式忽略 |
-| `schema_migrations` | 新建（§2.2，含 `seq` 排序键）；唯一写入者 = 迁移器与基线登记 |
+| `schema_migrations` | 由**迁移器入口事务**创建（§2.2，含 `seq` 排序键）；**不进 `init_db()` 的 `SCHEMA`**；唯一写入者 = 迁移器与基线登记 |
 | `system_events` / `migration_tx_notes` | **P-1 不建**。因此 P-1 **不实现** v1.10 的持久化事件链（§2.5.1），halt 只写 `migration-fault.log` 与 maintenance 文件 |
 
 > 这一条必须明确：v1.10 的 `system_events`（8 列 + 两个唯一约束 + 哈希链）属 P0 阶段。P-1 的 phase 痕迹只落在 `schema_migrations.status`，**不足以**承载 A/B/C 三分类与 `settle_uncertain`。任何"用 `schema_migrations` 冒充事件表"的写法都在本轮被禁止。
@@ -556,7 +609,8 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 | PT-06 | `schema_migrations` 幂等 | 连续启动 5 次，行数恒为 1；`status='success'`；`seq` 不变 |
 | PT-06b | 版本排序 | 手工插入 `seq=1 version='1.9'`、`seq=2 version='1.10'`（均 success）⇒ `current_version()` 必须返回 `1.10`；把实现改成 `MAX(version)` 的负向对照必须失败 |
 | PT-06c | 基线原子性 | 在 `INSERT` 基线行前注入异常 ⇒ 事务回滚 ⇒ 表与基线**同时不存在**（不出现"表在行缺"）；再启动一次正常登记，行数 1 |
-| PT-06d | 基线核对 | 故意把 `structure_hash` 与实测 `sqlite_master` 摘要不一致 / `app_version` 与 P-10 不一致 ⇒ 拒绝登记并报 `baseline_structure_mismatch` / `version_mismatch` |
+| PT-06d | 基线核对 + `tasks` 双合法结构 | ① 摘要不一致 / `app_version` 与 P-10 不一致 ⇒ 拒绝登记并报 `baseline_structure_mismatch` / `version_mismatch`；② **无 `tasks`** 的库 ⇒ 登记通过，`tasks_present=false`；③ **有 `tasks`（0 行）** 的库 ⇒ 同样通过，`tasks_present=true`、`tasks_rows=0`，且两者 `structure_hash` **完全相等**；④ `tasks` 有 1 行 ⇒ 仍通过登记（只记录 `tasks_rows=1`，不拒绝、不动它）；⑤ 断言登记前后 `tasks` 的 `sqlite_master` 定义与行数**逐字节不变** |
+| PT-06e | 建表时机 | `init_db()` 连跑 3 次后 `schema_migrations` 必须不存在（`table_exists()`=False，且 `migration_incomplete()` 仍为 `False`）；随后 `preflight()` 一次即建表 + 基线 1 行，全程无"空表被拒"路径 |
 | PT-07 | 迁移注入"备份失败" | `halt_migration("snapshot_failed")`；不写 `running`；退出码非零；写入仍被拒 |
 | PT-08 | 迁移注入"`ALTER` 中途抛错" | 事务回滚；`running` → `failed`；快照恢复后 L1/L2 通过；服务可写 |
 | PT-09 | 注入 `set_maintenance()` 抛错但封锁成功（对应 MC63） | `maintenance_ok=False` ⇒ `fatal_exit("maintenance_unconfirmed")`；不返回正常 `HALTED`；零 DB 写入 |
@@ -605,8 +659,8 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 | --- | --- | --- | --- | --- |
 | F1 | 快照失败（空间/IO） | `halt_migration("snapshot_failed")` | 写入封锁 + `HALTED` | 清维护态前先修磁盘；业务保持只读 |
 | F2 | 快照验证 L1/L2 失败 | 同上 | 同上 | 换备份策略，不迁移 |
-| F3 | `schema_migrations` 写 `running` 失败 | 记 `KNOWN_FAILED`（事务已回滚、只读确认未写） | 服务可继续 | 直接重启，无需恢复 |
-| F4 | DDL 执行抛错 | 事务 ROLLBACK → 判 `KNOWN_FAILED` | 标 `failed`，服务可继续 | 从快照恢复（若已部分动表） |
+| F3 | `schema_migrations` 写 `running` 失败 | 事务已回滚，只读确认**无** `running`/`failed` 行残留 | 可返回原状（服务可写） | 直接重启；若复查发现残留行 ⇒ 立即降级为 F4 |
+| F4 | DDL 执行抛错 | 事务 ROLLBACK → 判 `KNOWN_FAILED` → 标 `failed` | **写入封锁**：`failed` ⇒ `migration_incomplete()`=True ⇒ `RECOVERY_REQUIRED`（503） | 恢复 `pre-migrate` 备份集 → L1/L2 → 人工确认清维护态 → 重启 → 只读复核 → 才解封 |
 | F5 | 提交结果不确定 | 判 `OUTCOME_UNKNOWN` → `halt_migration("commit_outcome_unknown")` | 写入封锁 | 只读比对表结构与 `schema_migrations` → 人工决策（P-1 无事件表可重查） |
 | F6 | `set_maintenance` 失败 | 继续封锁 → `fatal_exit("maintenance_unconfirmed")` | 进程退出，写入已被挡 | 修复后重启，走 `RECOVERY_REQUIRED` |
 | F7 | 写入封锁无法确认 | `fatal_lockdown` + `fatal_exit("writes_block_unconfirmed")` | 进程退出 | 停容器（`docker stop`）后离线恢复 |
@@ -624,7 +678,7 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 | 步骤 | 内容 | 可回退性 | 验收条件 |
 | --- | --- | --- | --- |
 | P-1.1 | 生产探针（§1.3，P-1~P-10）与基线存档 | 只读（P-7 例外） | 十项输出逐项回填 §1.2.7；每项判据通过；P-7 与 P-10 缺一即不得进 P-1.2 |
-| P-1.2 | `schema_migrations`（含 `seq`）+ 原子基线登记 | 可 `DROP TABLE` | PT-06/06b/06c/06d 通过；基线 `version` 由 P-10 实测值确定；17 张业务表零变化 |
+| P-1.2 | `schema_migrations`（含 `seq`）+ **迁移器事务内**建表与原子基线登记 | 可 `DROP TABLE` | PT-06/06b/06c/06d/06e 通过；`init_db()` 不建该表；基线 `version` 由 P-10 实测值确定；17 张业务表零变化 |
 | P-1.3 | `backup.py`（备份集三件套 + `verify_set`） | 删文件 + 开关回退 | PT-01/03/04/04b/21 通过 |
 | P-1.4 | `maint.py` + `STATE_DIR` 同卷校验 + 启动自检 | 删文件 | PT-11/14/14b/24 通过 |
 | P-1.5 | 五入口 + 二次级机制接线（A/B 分离） | 拆中间件 | PT-15/16/23 通过 |
@@ -653,6 +707,8 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 | 11 | 把 `wal_checkpoint` 当只读操作误用 | 会在任意时刻改动 `-wal`，干扰排查甚至抢锁 | 只读探针禁止 checkpoint；checkpoint 只出现于停写窗口（PT-24 审计） |
 | 12 | 恢复时只关当前线程连接 | 其他线程句柄仍持有旧库，替换后读到旧 inode | `close_all_connections()` + 句柄扫描 + 替换前中止条件（PT-22） |
 | 13 | 基线版本猜错（凭 commit 推断） | 版本记录与真实运行版本不符，后续迁移误判 | 基线必须用 P-10 实测（tag/digest/`config.VERSION`/`healthz`）并核对结构摘要 |
+| 15 | `/healthz` 无版本字段却被当作"已核对" | 四值核对失真 | 实测无该字段即记 `ABSENT`，降级三值 + 标记待补能力，不得宣称四值完成 |
+| 16 | 通用 `init_db()` 提前建空 `schema_migrations` | 迁移器读到空表永久拒绝迁移（启动即锁死） | 该表不进 `SCHEMA`，只由迁移器入口事务创建（PT-06e 钉住） |
 | 14 | 备份集"有库无清单"被当有效 | 恢复时缺校验依据 | 三件齐全判据 + 半成品 24h 保护（PT-21） |
 
 ---
@@ -670,4 +726,6 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 ② **P-10**（镜像 digest + `app_version`）——决定基线 `version` 写什么，不能凭 commit 推断；
 ③ **P-4**（`integrity_check` 与 `journal_mode`）——决定库本身是否允许动手。
 
-本轮修正说明（相对上一版）：P-5 拆成"句柄/锁/未提交事务"三件事并删除只读探针里的 `wal_checkpoint`；P-7 修正 fsync 的 fd 用法并补齐"写入→文件 fsync→rename→目录 fsync→回读→删除→再 fsync"，且强制在真实 `STATE_DIR` 上跑；`STATE_DIR` 改为独立子目录 + 同卷校验；六通道按 A/B 重排；P-1 明确只实现最小状态机（不建事件表、不冒充完整事件链）；`schema_migrations` 增加 `seq` 排序键、基线原子登记并强制与实测版本核对；L2 参照物限定为同一快照；备份改为"三件套 + 原子发布"；恢复流程补全停服/全连接关闭/句柄确认/WAL 处理/原子替换/失败回退。
+**待补能力（本轮不改，登记备查）**：若 P-10 实测显示 `/healthz` 没有版本字段，则"健康端点自带版本"属能力缺口，记为待补（P-1 后的独立小改动，不进本轮范围）；在此之前基线版本只能靠 `config.VERSION` + image digest 三值确定，且**不得**对外声称已做四值核对。
+
+本轮修正说明（相对上一版）：P-10 补齐 `/healthz` 实测命令与"四值核对规则"（无版本字段则降级三值并标待补）；P-5 改为同一只读连接双读 `data_version` 并输出 `before/after/changed`；`schema_migrations` 从 `db.py` 的 `SCHEMA` 移出，改由迁移器入口事务建表+基线+计数校验（PT-06e 钉死无"先建空表"路径）；`structure_hash` 把 `tasks` 摘出主摘要、独立记账并保留双合法结构（PT-06d 增四个子用例）；`failed` 状态统一为"写入封锁 + `RECOVERY_REQUIRED`"，唯一解封路径=恢复 `pre-migrate` 备份集。更早一轮的修正：P-5 拆成"句柄/锁/未提交事务"三件事并删除只读探针里的 `wal_checkpoint`；P-7 修正 fsync 的 fd 用法并补齐"写入→文件 fsync→rename→目录 fsync→回读→删除→再 fsync"，且强制在真实 `STATE_DIR` 上跑；`STATE_DIR` 改为独立子目录 + 同卷校验；六通道按 A/B 重排；P-1 明确只实现最小状态机（不建事件表、不冒充完整事件链）；`schema_migrations` 增加 `seq` 排序键、基线原子登记并强制与实测版本核对；L2 参照物限定为同一快照；备份改为"三件套 + 原子发布"；恢复流程补全停服/全连接关闭/句柄确认/WAL 处理/原子替换/失败回退。
