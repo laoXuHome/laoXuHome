@@ -285,17 +285,19 @@ docker exec nodepool sh -c 'stat -f -c "state_fs=%T block=%s" /data; stat -f -c 
 **做法**：
 
 1. 一律用 SQLite 在线备份 API（`src.backup(dst, pages=1024)`）。**禁止** `cp`/`shutil.copy2` 正在使用的库：WAL 下文件拷贝会得到缺表丢行的副本（§2.4 有实测反例）。
-2. 备份源用**独立只读连接**（`mode=ro`），不复用业务线程连接。
+2. 备份源用**独立连接**：冻结文件用 `mode=ro&immutable=1`；活库必须 `mode=rw` + `PRAGMA query_only=1`（纯 `mode=ro` 在 WAL 有未 checkpoint 页时会读到旧数据，实测会丢已提交行），不复用业务线程连接。
 3. **产物是单文件 + 同名元信息**，不再是"备份集目录"，也不再有三件套：
 
 ```
-BACKUP_DIR/nodepool-YYYYMMDD-HHMMSS-<label>.db    # 一致性快照（独立文件，可单独拷走）
-BACKUP_DIR/nodepool-YYYYMMDD-HHMMSS-<label>.json  # 元信息：created_at/app_version/sqlite_version/
+BACKUP_DIR/nodepool-YYYYMMDD-HHMMSS-<label>-<6位hex>.db    # 一致性快照（独立文件，可单独拷走）
+BACKUP_DIR/nodepool-YYYYMMDD-HHMMSS-<label>-<6位hex>.json  # 元信息（与 .db 同基名，强制成对）：created_at/app_version/sqlite_version/
                                                  # db_bytes/sha256/integrity_check/structure_hash/
                                                  # structure_profile/schema_version/tasks/tables/key_digests
 ```
 
-4. 发布顺序：`.tmp-<nonce>.db` 写入 → `fsync` → **独立只读连接**上 `integrity_check` + 表集合 + 结构摘要 → 全部通过才 `os.replace` 落名 → 目录 `fsync` → 写元信息（含 sha256）→ 目录 `fsync`。校验不过即删除临时文件，**不产生半成品文件**。
+4. 发布顺序：`.tmp-<nonce>.db` 写入 → `fsync` → **独立只读连接**上 `integrity_check` + 表集合 + 结构摘要 → 全部通过才落名 → 目录 `fsync` → 写元信息（含 sha256）→ 目录 `fsync`。校验不过即删除临时文件，**不产生半成品文件**。
+   落名用 `os.link(tmp, candidate)` 的**排他语义**：候选名自带 6 位随机后缀，`FileExistsError` 就换名重试（上限 64 次），**绝不 `os.replace` 覆盖已有备份**；同秒连续导出、并发导出都必须各自得到唯一文件名；程序不删任何旧备份。
+5. **元信息强制成对**：`.db` 与同名 `.json` 缺一即无效；`REQUIRED_META_FIELDS`（format=2、created_at、app_version、sqlite_version、db_bytes、sha256、integrity_check、structure_hash、structure_profile、schema_version、tasks、tables、key_digests）缺任一字段、JSON 不可解析、`format` 非 2、`db_bytes`/`sha256`/`structure_hash`/`integrity_check` 与实文件不匹配，一律 `verify` 失败。`verify` 与 `import` 调用**同一函数**、同一严格规则；无效备份不得进入维护态、不得改目标库。
 5. **不做滚动清理**：备份由用户保管，程序不自动删除、不生成 `nodepool-latest.db` 指针、不设 `pre-migrate`/`pre-restore` 保护标记。
 6. CLI：`python -m backend.database.cli backup [--out DIR] [--label manual]`；`/api/system/backup` 与 `/download` 复用同一函数（`ok/file/size/sha256/integrity_check`）。
 
@@ -546,9 +548,9 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 2. **进入维护**：`set_maintenance()`（`migration_id=import-<stamp>`，`reason=manual_import`）→ 回读确认；失败即退出，不做文件操作。
 3. **停写**：`gate.apply_state(ACTIVE)` + `pool.block_writes()` + `confirm_writes_blocked()`；未确认 ⇒ 非零退出，绝不动文件。
 4. **排空**：`drain(rounds=2, min_interval=10.0)`；未通过 ⇒ 中止，维护态与封锁保持。
-5. **关闭全部连接**：`db.close_all_connections()`（不是只关当前线程）。
-6. **句柄复核**：`/proc/*/fd` 扫描目标库与 `-wal/-shm`；有第三方持有 ⇒ `import_handles_present`，中止且不替换。
-7. **WAL/SHM 与替换**：把 `-wal`/`-shm` 改名为 `*.preimport-<stamp>`（不删除，供复原）；原库单副本 `copyfile` + fsync 到 `*.preimport-<stamp>.db`；备份文件复制到同卷 `.import-<nonce>.db` + fsync + 复核；`os.replace` + 目录 fsync。
+5. **关闭全部连接并逐条确认**：`db.close_all_connections_report()` 返回 `{closed, failed:[{label,error}], remaining, ok}`；**只有关闭成功**的连接才从登记表移除，关闭失败/未关闭的一律留在表内并计入 `remaining`；线程本地 `conn`/`ro` 同规则处理。任一条 `failed`/`remaining` 非空或 `ok=False` ⇒ `connections_not_closed`，**中止导入**，维护态与写封锁保持，不替换任何文件。
+6. **句柄复核（含本进程）**：`holders_of(target)` 扫 `/proc/*/fd` 找第三方持有；`self_handles_of(target)` 扫 `/proc/self/fd` 复核本进程自身对目标库与 `-wal/-shm` 的句柄；任一命中 ⇒ `import_handles_present` / `import_self_handles_present`，中止且不替换。不能确认"全部关闭"时不得替换数据库。
+7. **WAL/SHM 与替换**：先用 SQLite 在线备份 API 生成原库副本 `*.preimport-<stamp>.db`（不是 `copyfile` 主库：主库可能缺少尚未 checkpoint 的已提交 WAL 页）；副本用 `_probe_file` 只读校验 + 与当前库逐表计数比对，不等即 `preimport_incomplete` 且不动替换；副本完好后才把 `-wal`/`-shm` 改名隔离（不删除）；备份文件复制到同卷 `.import-<nonce>.db` + fsync + 复核；`os.replace` + 目录 fsync。preimport 副本保留，不自动删除。
 8. **替换后复核**：独立只读连接 `integrity_check` → 表集合 → 结构摘要 → 逐表计数与**源备份文件**比对；不一致即复原并报 `import_verify_failed`。
 9. **收尾**：成功 ⇒ 清理空的 `-wal/-shm`、保留 `*.preimport-*.db` 供人工确认、删 `maintenance.json` + 目录 fsync + 复核 INACTIVE + 解除写封锁；失败 ⇒ 维护态与写封锁保持，报 `import_failed` / `import_rolled_back` / `import_failed_leftover`。
 10. 全程禁止：`reset_connection()` 后 `shutil.copy2` 覆盖（旧实现做法）、在仍有连接/句柄时删 `-wal`、把"上传文件"直接当恢复源、自动多级回退或恢复子进程。
@@ -585,9 +587,9 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 
 | 编号 | 场景 | 通过判据 |
 | --- | --- | --- |
-| PBT-01 | `export_backup()` 正常导出 | 生成单个 `.db` + 同名 `.json`；`integrity_check=ok`；元信息 `sha256/db_bytes` 与实文件一致；目录里没有子目录/三件套 |
+| PBT-01 | `export_backup()` 正常导出 | 生成单个 `.db` + 同名 `.json`；`integrity_check=ok`；元信息 `sha256/db_bytes` 与实文件一致；目录里没有子目录/三件套；文件名含 6 位随机后缀 |
 | PBT-02 | 运行期导出一致性（WAL + 并发写） | 备份 `integrity_check=ok`；未提交行不出现；行数介于导出起止之间；**不要求**与实时源库相等 |
-| PBT-03 | `verify_backup()` L1 | 良好备份全绿；截断 / 头部损坏 / 删表 / 改元信息 sha 四种坏文件必须失败 |
+| PBT-03 | `verify_backup()` L1 + 严格元信息 | 良好备份全绿；截断 / 头部损坏 / 删表 / 改元信息 sha / 缺 `.json` / JSON 损坏 / 缺必备字段 七种坏文件必须失败；`import` 与 `verify` 同一规则 |
 | PBT-04 | 元信息自洽（L2） | 元信息 `tables` 与备份文件逐表计数不符 ⇒ 失败；`structure_hash` 不符 ⇒ `meta_structure_mismatch` |
 | PBT-05 | 人工恢复演练（独立端口 8089） | 导入到独立副本 + 独立 `STATE_DIR` 起临时实例：`/healthz` 200、机场/节点/设置条数与元信息一致、订阅四格式可重建 |
 | PT-05 | L3 恢复演练（独立端口 8089） | `/healthz` 200；机场/节点/设置条数与源一致；订阅四格式可重建 |
@@ -618,6 +620,12 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 | PT-24 | 探针脚本副作用审计 | 第 1–4、6–8 段在一次性副本库上执行，前后 `sha256(db)`、`-wal` 大小、`mtime` 均不变；第 5 段只在 `STATE_DIR` 造文件、不触碰 `nodepool.db*` |
 | PT-25 | `migration_incomplete()` 语义保持 | 表不存在 ⇒ `False`；有 `running`/`failed` ⇒ `True`；查询异常 ⇒ `MaintUnverifiable`；空表的"拒绝迁移"只由 preflight 产生，不改该函数返回值 |
 | PBT-09 | WAL/SHM 与迁移解耦 | 目标库带遗留 `-wal/-shm`（伪造脏帧）时导入成功且旧帧不残留；迁移 dry-run 期间 `BACKUP_DIR` 零新增文件 |
+| PBT-11 | 连接关闭逐条确认 | 关闭失败的连接留在登记表、`ok=False`；CLI 在 `close_connections` 判定失败即 `connections_not_closed` 中止，库不变、维护态与封锁保持 |
+| PBT-12 | 本进程遗留句柄 | 本进程持有目标库/`-wal`/`-shm` 句柄 ⇒ `import_self_handles_present`，中止且不替换 |
+| PBT-13 | 元信息严格校验 | 缺 `.json` / JSON 损坏 / 缺必备字段 三态均拒绝，且不进入维护态、目标库零改动 |
+| PBT-14 | 同秒导出不覆盖 | 固定时间戳连导 3 次，得到 3 个不同文件名、3 份可校验备份，旧文件 sha 不变 |
+| PBT-15 | 并发导出不覆盖 | 6 线程同时导出，文件名互不相同、全部可校验、无失败 |
+| PBT-16 | preimport 完整性 | 子进程写入后 `os._exit(0)` 造未 checkpoint 的已提交 WAL 页；导入后 `*.preimport-<stamp>.db` 的逐表计数等于含 WAL 的真实库且含该行，副本保留 |
 
 判据统一口径：**每一项必须给出"命令 + 期望输出 + 不通过时的处置"**；"跑通了"不算通过，必须贴输出。
 
@@ -705,5 +713,7 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 ③ **P-4**（`integrity_check` 与 `journal_mode`）——决定库本身是否允许动手。
 
 **待补能力（本轮不改，登记备查）**：若 P-10 实测显示 `/healthz` 没有版本字段，则"健康端点自带版本"属能力缺口，记为待补（P-1 后的独立小改动，不进本轮范围）；在此之前基线版本只能靠 `config.VERSION` + image digest 三值确定，且**不得**对外声称已做四值核对。
+
+**P-1.7 验收修正（本版追加）**：① `close_all_connections` 改为返回逐条关闭报告的 `close_all_connections_report()`，失败连接不出表、CLI 以 `ok` 判定中止，并把本进程 `self_handles_of()` 纳入复核；② 元信息强制成对且字段齐全、sha/大小/结构摘要实配，`verify` 与 `import` 共用同一严格校验；③ 备份落名改 `os.link` 排他 + 6 位随机后缀，同秒/并发唯一、绝不覆盖、不删旧；④ preimport 改用在线备份 API 生成（含未 checkpoint 的 WAL 已提交页）并做逐表计数比对，副本保留；专项测试增至 19 项（PBT-11…16）。架构仍为"手动导出单文件 + 完整性校验 + 手动导入 + 导入期维护保护"，未重新引入自动恢复链/多级快照/恢复子进程。
 
 **v1.10 备份/导入简化修订（本版）**：删除自动恢复体系——`snapshot_set()` 三件套/`complete.json`/`restore_set()`/`prune()`/`pre-restore` 多级回退/恢复子进程/`rollback_to_snapshot()`/`RESTORE_SEQUENCE`/`migrate.run(snapshot=True)` 全部移除；改为"手动导出单文件 + 手动导入 + 完整性校验 + 导入期维护保护"。备份与迁移彻底解耦：迁移失败不自动恢复、不自动找备份。测试编号 PT-01/02/03/04/04b/17/21/22/26 由 PBT-01…09 取代（原编号保留在历史交付材料中，不再对应当前实现）。更早的修正说明（相对上上版）：P-10 补齐 `/healthz` 实测命令与"四值核对规则"（无版本字段则降级三值并标待补）；P-5 改为同一只读连接双读 `data_version` 并输出 `before/after/changed`；`schema_migrations` 从 `db.py` 的 `SCHEMA` 移出，改由迁移器入口事务建表+基线+计数校验（PT-06e 钉死无"先建空表"路径）；`structure_hash` 把 `tasks` 摘出主摘要、独立记账并保留双合法结构（PT-06d 增四个子用例）；`failed` 状态统一为"写入封锁 + `RECOVERY_REQUIRED`"，唯一解封路径=恢复 `pre-migrate` 备份集。更早一轮的修正：P-5 拆成"句柄/锁/未提交事务"三件事并删除只读探针里的 `wal_checkpoint`；P-7 修正 fsync 的 fd 用法并补齐"写入→文件 fsync→rename→目录 fsync→回读→删除→再 fsync"，且强制在真实 `STATE_DIR` 上跑；`STATE_DIR` 改为独立子目录 + 同卷校验；六通道按 A/B 重排；P-1 明确只实现最小状态机（不建事件表、不冒充完整事件链）；`schema_migrations` 增加 `seq` 排序键、基线原子登记并强制与实测版本核对；L2 参照物限定为同一快照；备份改为"三件套 + 原子发布"；恢复流程补全停服/全连接关闭/句柄确认/WAL 处理/原子替换/失败回退。
