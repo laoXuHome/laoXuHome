@@ -823,7 +823,7 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 
 - `COMMIT_ATTEMPTED` 只表示“提交结果不确定”，**不保证**数据库存在 `running` 行；
 - 重启后**必须用只读连接读取真实数据库**（`schema_migrations` 行集合与 17 表计数），**禁止**根据 phase 推断行集合；
-- 凡“维护文件仍在、尚未完成释放”的情况一律 `RECOVERY_REQUIRED`，不得自动开放写入。
+- 锁空闲（上一进程已终止）且维护文件仍在、尚未完成释放时，一律 `RECOVERY_REQUIRED`，不得自动开放写入。
 
 #### 8.5.2 SIGKILL 与 UNKNOWN 的边界
 
@@ -863,7 +863,7 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 | `COMMIT_ATTEMPTED` | 空闲 | 仅基线 | `RECOVERY_REQUIRED`（`commit_not_applied_or_rolled_back`） | 提交前被杀或提交失败；**不得**因 phase 假设 running 存在 |
 | `COMMIT_ATTEMPTED` | 空闲 | 基线 + `running` | `RECOVERY_REQUIRED`（`committed_not_finalized`） | 已提交未收尾；禁止重跑迁移 |
 | `COMMIT_ATTEMPTED` / `COMMITTED` | 空闲 | 基线 + `success` | `RECOVERY_REQUIRED`（`success_pending_release`） | 迁移已完成，人工确认后按成功收尾，无需导入 |
-| `TX_OPEN` / `COMMIT_ATTEMPTED` | 空闲 | 基线 + `failed` | `RECOVERY_REQUIRED`（`migration_failed`） | 故障路径，走 `import --recover` |
+| `TX_OPEN` / `TX_ROLLED_BACK` / `COMMIT_ATTEMPTED` | 空闲 | 基线 + `failed` | `RECOVERY_REQUIRED`（`migration_failed`） | 故障路径，走 `import --recover` |
 | `UNKNOWN` | 空闲 | 任意 | `RECOVERY_REQUIRED`（`outcome_unknown`） | 只能人工判定后导入 |
 | 任意（文件缺失） | 空闲 | `running`/`failed` 存在 | `RECOVERY_REQUIRED` | 既有 `judge_by_migration_rows()` 证据 |
 | 任意 | 被持有 | — | 拒绝启动（`already_running`） | 另一进程正在迁移，不得判失败 |
