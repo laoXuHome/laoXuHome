@@ -638,8 +638,8 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 1. 导出：`python -m backend.database.cli backup --out /backup/manual` → 得到 `nodepool-<stamp>-manual.db` 与同名 `.json`；命令输出 `integrity_check=ok`。
 2. 校验：`python -m backend.database.cli verify --file <文件>` → `ok=true`；再故意截断一份副本，确认 `ok=false` 且报 `integrity_check`/`sqlite_error`。
 3. 演练：把该 `.db` 复制到 `/tmp/restore-check/`，起临时实例（`-p 8089:8080`、`NODEPOOL_DB` 指向副本、`NODEPOOL_STATE_DIR` 指向临时空目录、`NODEPOOL_MIGRATION_ENABLED=0`），验证 `/healthz` 200、机场/节点/设置条数与元信息一致、订阅四格式可重建；完成后停实例、删副本。
-4. 真机导入（仅在维护窗口）：停应用/容器 → `python -m backend.database.cli import --file <文件>` → 观察 `steps` 依次为 `source_verified/maintenance/stop_writes/drain/close_connections/import_atomic/verify_imported/release` → 重启 → 只读复核（`status` 为 `INACTIVE`、`verify` 为 `ok`）。
-5. 失败处置：命令以非零退出并给出 `import_*` 机器码时，**不要**改库、不要重复导入；先看 `*.preimport-<stamp>.db` 与 `migration-fault.log`，人工确认后再决定。
+4. 导入演练（**仅独立 Docker 测试容器**）：在容器 `nodepool-p18-test` 内，`DATA_DIR=/tmp/p18test/data`、`BACKUP_DIR=/tmp/p18test/backup`、`STATE_DIR=/tmp/p18test/state`、`NODEPOOL_DB` 指向测试库副本，端口 8089；停测试容器内应用进程 → `python -m backend.database.cli import --file /tmp/p18test/backup/<备份>.db` → 观察 `steps` 依次为 `source_verified/maintenance/stop_writes/drain/close_connections/import_atomic/verify_imported/release` → 重启测试容器 → 只读复核（`status` 为 `INACTIVE`、`verify` 为 `ok`）。**不得**在任何生产容器、NAS 目录或真实维护窗口中执行本步骤。
+5. 失败处置：命令以非零退出并给出 `import_*` 机器码时，**不要**改库、不要重复导入；先看测试目录下的 `*.preimport-<stamp>.db` 与 `migration-fault.log`，人工确认后再决定。
 
 ## 7. 失败处理与回滚矩阵
 
@@ -672,7 +672,7 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 | P-1.5 | 五入口 + 二次级机制接线（A/B 分离） | 拆中间件 | PT-15/16/23 通过 |
 | P-1.6 | `migrate.py` 最小状态机（无事件链）+ 空迁移 dry-run | 删文件 | PT-09b/12/13/19/25 通过；`write_event()` 抛 `NotImplementedError` |
 | P-1.7 | 手动导入 + 维护保护 + 失败现场（隔离演练 8089） | 不影响生产 | PBT-05/06/07/08/09/10 通过；P-1.6 迁移测试不回归；无自动恢复链残余 |
-| P-1.8 | **Docker 迁移演练与交付验证**（隔离容器，不碰生产） | 删除容器与测试目录即可，无生产副作用 | §8.1 R1–R8 全通过；迁移窗口 ≤60s；中断/失败路径均 fail-closed；四格式订阅可重建；30 分钟容器内观察无 5xx |
+| P-1.8 | **Docker 迁移演练与交付验证**（隔离容器，不碰生产） | 删除容器与测试目录即可，无生产副作用 | §8.1 R1–R8 全通过（含 §8.2 R4-a…d）；`T_mig`≤60s；中断/失败路径均 fail-closed；四格式订阅可重建；30 分钟容器内观察无 5xx |
 
 每步之间必须停下汇报，不得连做。P-1.1 之前不允许写任何代码。
 
@@ -689,7 +689,7 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 | R1 | 正常迁移 | 迁移前 `cli backup` 成功；迁移 `success` 唯一；重启后只读复核通过；四格式订阅重建；`/healthz` 200 |
 | R2 | 重复执行幂等 | 已迁移库再次启动不重复 DDL；显式拒绝或明确 no-op，不产生第二条 success |
 | R3 | 迁移中断 | 在 DDL 阶段 `docker kill`/`kill -9`；重启后 `RECOVERY_REQUIRED` + 写入 503；无自动恢复、无自动找备份 |
-| R4 | 迁移失败处理 | 注入 DDL 错误 ⇒ `failed` + 写封锁；`cli import` 迁移前备份 → 逐表计数复核 → 清维护 → 重启 → 只读复核 → 解封 |
+| R4 | 迁移失败与恢复路径 | 见 §8.2：DDL 失败/`docker kill` 中断均进入 `RECOVERY_REQUIRED`；`import --recover --reason` 仅接受显式备份且先严格校验；全程保持写封锁；导入后完整性与逐表数据校验通过才清维护解封；失败保持封锁 |
 | R5 | 手动回滚演练 | 迁移成功后用迁移前备份 `cli import` 回退旧结构；表集合/逐表计数/结构摘要与备份一致；订阅按旧版重建 |
 | R6 | 坏备份拒绝 | 截断/篡改/元信息缺失或内容不实配 ⇒ `verify` 与 `import` 均拒绝，目标库零改动 |
 | R7 | 句柄与写封锁 | 容器内仍有连接/句柄时导入中止（`import_self_handles_present`/`import_handles_present`），维护态保持 |
@@ -708,6 +708,71 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 **明确排除**（不属本阶段，另行立项并单独审批）：生产数据库迁移、NAS 停机窗口、生产切换/部署、生产 `STATE_DIR` 的 P-7 写探针、生产备份目录读写、生产配置与容器变更。
 
 **停止条件**：R1–R8 完成并交付后立即停止；不执行 NAS 部署或生产迁移，不进入下一阶段，等待独立复审。
+
+### 8.2 R4 恢复路径：`RECOVERY_REQUIRED` 下的授权导入
+
+**现状问题**：`cli._import()` 只接受 `INACTIVE`；而迁移失败/中断后 `schema_migrations` 存在非 success 行，`gate.judge()` 返回 `RECOVERY_REQUIRED`，现有导入入口会直接拒绝，恢复路径断裂。
+
+**设计原则**：不放宽 INACTIVE 检查，而是**显式增加**一条只用于恢复的分支；恢复分支必须有授权、有审计、全程保持写封锁，且只有校验全部通过才允许解封。
+
+**授权方式**：`import --file <备份> --recover --reason "<说明>"`。缺少 `--recover` 时，`RECOVERY_REQUIRED` 一律拒绝（`recovery_confirmation_required`）；缺少 `--reason` 时拒绝（`recovery_reason_required`）；`ACTIVE` 一律拒绝（`maintenance_active`，迁移仍在进行，须先停容器）。授权记录写 `migration-fault.log`（`recovery_import_started`：时间、`operator_uid`、备份名、sha256、reason）。
+
+**状态转换表**：
+
+| 步 | 起始状态 | 动作 | 成功去向 | 失败去向 |
+| --- | --- | --- | --- | --- |
+| S0 | `RECOVERY_REQUIRED` | 解析参数、`gate.judge()` 复核 | S1 | 拒绝（退出码 2），状态不变 |
+| S1 | `RECOVERY_REQUIRED` | `verify_backup()` 严格校验（元信息成对、字段齐全、内容实配、integrity） | S2 | `backup_invalid`，**未进维护、目标库零改动**，状态仍 `RECOVERY_REQUIRED` |
+| S2 | `RECOVERY_REQUIRED` | 写恢复维护记录（`maintenance=true`、`reason=recovery_import`、`migration_id=recover-<stamp>`、phase `PREPARED`）+ 目录 fsync + 回读 | S3（`ACTIVE`） | `recovery_maintenance_unconfirmed`，保持封锁 |
+| S3 | `ACTIVE` | `gate.apply_state(ACTIVE)` + `pool.block_writes` + `confirm_writes_blocked` | S4 | 退出码 4；维护文件保留，写保持封锁 |
+| S4 | `ACTIVE` | `drain(rounds=2, min_interval=10)` | S5 | `drain_failed`，维护与封锁保持 |
+| S5 | `ACTIVE` | `close_all_connections_report()`，`ok` 必须为真 | S6 | `connections_not_closed`，维护与封锁保持，不替换文件 |
+| S6 | `ACTIVE` | `import_backup()`：本进程/第三方句柄复核 → preimport 快照（含 WAL）→ WAL/SHM 隔离 → 原子替换 → 完整性/结构/逐表计数复核 | S7 | `import_*`；尽力复原原失败库，维护与封锁保持 |
+| S7 | `ACTIVE` | 恢复后复核：`inspect_db(target)` 完整性/结构；逐表计数与备份元信息一致；`schema_migrations` 必须**不存在或全部 success**，且 `current_version` 为基线或空 | S8 | `recovery_backup_incomplete` / `recovery_postcheck_failed`，维护与封锁保持 |
+| S8 | `ACTIVE` | 删 `maintenance.json` + 目录 fsync + 回读 `gate.judge()==INACTIVE` + `gate.release()` | S9 | 回读非 `INACTIVE` ⇒ **不解封**，恢复维护文件并报 `recovery_release_refused` |
+| S9 | `INACTIVE` | 退出码 0，提示重启并只读复核 | — | — |
+
+**硬约束**：
+
+1. 坏备份在恢复态同样先被拒，且**发生在写维护记录之前**，目标库不变。
+2. S2 之后任何失败都不得删除维护文件、不得 `gate.release()`；`RECOVERY_REQUIRED` 语义保持。
+3. 导入的备份若自身含 `running`/`failed` 行（迁移中途备份），S7 拒绝解封（`recovery_backup_incomplete`），避免"用坏状态覆盖坏状态"。
+4. 设置 `--db` 时只允许指向测试副本；生产主库路径在 P-1.8 施工中继续由运行环境隔离，不在本阶段验证。
+5. 恢复成功后仍需重启进程并做只读复核，才视为完成。
+
+**R4 专项验收**：
+
+| 编号 | 场景 | 断言 |
+| --- | --- | --- |
+| R4-a | DDL 失败 | 注入 `ALTER`/非法语句 ⇒ `status='failed'`、`RECOVERY_REQUIRED`、写入 503；`import --recover` 迁移前备份 → 成功 → `INACTIVE` → 只读复核通过 |
+| R4-b | `docker kill` 中断 | DDL 阶段强杀容器 ⇒ 重启后 `RECOVERY_REQUIRED`；`import --recover` 恢复成功；无自动恢复痕迹 |
+| R4-c | 坏备份 | 恢复态下用截断/元信息篡改备份 ⇒ 退出码 2、目标库计数与 sha 不变、状态仍 `RECOVERY_REQUIRED` |
+| R4-d | 恢复过程异常 | S3–S7 任一注入失败 ⇒ 维护文件仍在、`writes_blocked=True`、业务 503；重启后仍 `RECOVERY_REQUIRED` |
+
+### 8.3 P-1.8 迁移内容（不得自行扩展）
+
+**代码现状**：`migrate.run()` 仍是 P-1.6 框架——`dry_run=False` 抛 `p17_required`，默认零 DDL；`statements` 仅供测试注入。**R1–R5 目前不具备可执行的真实迁移基础**，施工前必须先由项目方确认下表内容并在代码层补齐演练入口（本轮只定义，不改代码）。
+
+| 项 | 定义 |
+| --- | --- |
+| 源数据库版本 | `1.8.7-baseline`（`VERSION_SEQ=1`），结构 = 17 张基准业务表 + 可选 `tasks` 历史表 |
+| 目标迁移版本 | `1.10`（`VERSION_SEQ=2`），仅版本标记，**无业务表结构变更** |
+| 实际 DDL | 仅 `schema_migrations`：`CREATE TABLE IF NOT EXISTS`（9 列 + `status` CHECK + `migration_id`/`seq` 唯一约束）；由 `ensure_schema_table_transactional()` 在同一 `BEGIN IMMEDIATE` 内建表 + 插基线行 + 行数校验 |
+| 数据转换 | 无业务数据转换。`migrate.run()` 在事务内插入 `running` 行（`seq=2, version=1.10`），提交后再置 `success` |
+| 迁移前后结构差异 | 业务 17 表结构、索引、触发器**零变化**，`structure_hash` 前后相同；仅新增 `schema_migrations` 辅助表（不计入 `BASE_TABLES`/结构摘要）；`tasks` 原样保留 |
+| 预期数据变化 | `schema_migrations` 从 1 行（基线）变为 2 行（基线 + `1.10` success）；全部业务表逐表计数不变 |
+| 预期不变项 | 节点身份/健康判断/评分逻辑、订阅产物格式、`settings`/`airports`/`nodes` 等全部行内容 |
+| 成功判据 | 事务提交成功；`status='success'` 行恰一条且 `current_version='1.10'`；无 `running`/`failed`；结构摘要与计数不变 |
+| 失败判据 | 事务内异常 → `ROLLBACK` 确认 → `status='failed'` → `RECOVERY_REQUIRED`；回滚/复核不可确认 → halt，不写伪造行 |
+| 重复执行判据 | 已成功后再次启动：`preflight` 返回 `version_mismatch`（期望 `1.8.7-baseline`，实际 `1.10`）⇒ 拒绝，不新增任何行；不得改写成"静默成功" |
+
+> 若后续批准真实业务 DDL（例如新增列/索引），必须先登记结构 profile、更新本节与 `structure_profile_for` 白名单，再施工；本阶段不包含任何未列出的业务数据迁移。
+
+### 8.4 迁移窗口计时口径
+
+**迁移执行窗口 `T_mig`（≤60s 的对象）**：起点 = `confirm_writes_blocked()` 首次返回成功；终点 = `migrate.run()` 返回 `committed` 且迁移连接关闭确认完成。包含排空、事务、行状态落库；不含迁移前备份导出与迁移后人工清维护/重启。
+
+**停写窗口 `T_block`（记录实测，不设新指标）**：起点同上；终点 = 删除维护文件并 `gate.release()` 成功。包含人工确认与重启，仅作记录，不用 ≤60s 判定。
 
 ---
 
@@ -742,7 +807,11 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 
 停止点：等总体审查确认 + 用户对 §1.3 探针（尤其 P-7 那一处写测试）的批准。**未获确认前不写任何业务代码、不动生产、不执行迁移、不进入 P-1.2。**
 
-**当前停止点（P-1.8 修订后）**：P-1.8 定义已修订为隔离 Docker 演练；本轮只交文档，未写代码、未执行迁移、未做 Docker 操作。等待 ChatGPT 复审；复审通过且收到施工指令后才进入 P-1.8 施工。
+**历史停止条件（P-1.1 阶段，仅存档）**：上文"等总体审查确认 + P-7 批准"是 P-1.1 开工前的历史条件，**不适用于 P-1.8**；P-1.8 的前置条件见 §8.1，与 P-7 生产探针无关。
+
+**当前停止点（P-1.8 第二轮修订后）**：定义、R4 恢复路径、迁移内容与计时口径已写入文档；本轮未写代码、未跑测试、未做 Docker 操作。等待 ChatGPT 第二轮复审；收到施工指令后才进入 P-1.8 施工。
+
+**待施工修正的代码注释（本轮不改）**：`backend/config.py:25`（"生产迁移窗口（P-1.8）才由运维显式置 1"）、`backend/database/migrate.py:1204`（"生产/开发主库要等 P-1.8"）、`migrate.py:1207`（"真实迁移在 P-1.7/P-1.8"）。这些旧表述与新 P-1.8 定义不符，登记为 P-1.8 施工首批清理项。
 
 需要用户回填的空白（共 10 项，对应 §1.2.7 的 P-1–P-10）：库体量与页数、SQLite 版本、表集合与行数、WAL/SHM 物理状态、句柄与外部持有者（含"未提交事务不可外部完整证明"这一限制）、备份目录与空间、`STATE_DIR` 同卷与原子性、运行身份与权限、`sub_publish` 当前配置与 `next_at`、镜像 digest 与 `app_version`。
 
@@ -752,6 +821,8 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 ③ **P-4**（`integrity_check` 与 `journal_mode`）——决定库本身是否允许动手。
 
 **待补能力（本轮不改，登记备查）**：若 P-10 实测显示 `/healthz` 没有版本字段，则"健康端点自带版本"属能力缺口，记为待补（P-1 后的独立小改动，不进本轮范围）；在此之前基线版本只能靠 `config.VERSION` + image digest 三值确定，且**不得**对外声称已做四值核对。
+
+**P-1.8 第二轮修订（第 21 次修订，2026-11-26）**：清理 §6 第 4 步"真机导入/维护窗口"残留，改为独立 Docker 测试容器导入演练；新增 §8.2 `RECOVERY_REQUIRED` 授权恢复路径（状态转换表 + R4-a…d）；新增 §8.3 迁移内容定义（源/目标版本、DDL、结构差异、数据变化、成功/失败/重复判据，明确 P-1.6 空迁移不足以支撑 R1–R5）；新增 §8.4 `T_mig`/`T_block` 计时口径；§10 旧 P-1.1/P-7 停止条件标注为历史；登记三处代码注释旧表述待施工修正。
 
 **P-1.8 定义修订（第 20 次修订，2026-11-26）**：应项目方裁决，P-1.8 由"生产窗口（需二次确认，本轮不做）"改为"**Docker 迁移演练与交付验证**"，新增 §8.1 定义目标、R1–R8 范围、前置条件、验收标准与排除项；§8 阶段表与 §6 L3、§9 风险适用范围同步修订。生产库迁移、NAS 停机窗口、生产切换明确排除在本阶段之外；P-1.7 已验收内容（`a62aeb2`）未改动，历史交付材料中的"P-1.8 停机窗口/生产窗口"表述视为已被本次修订取代，仅作修改记录保留。
 
