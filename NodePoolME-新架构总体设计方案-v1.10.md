@@ -2031,8 +2031,8 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 **`docker kill` 持久化证据缺口（D1–D3，待批准）**：当前 `maint.set_maintenance()` 只写一次 `phase='PREPARED'`，`set_phase_memory()` 不回写文件；SIGKILL 后重启，`maintenance_state()` 见 `maintenance=true` 直接返回 `ACTIVE`，无法与正常维护区分，也没有 `RECOVERY_REQUIRED` 的持久证据。必须以 D1–D3 补齐后才可验证 R3/R4-b：
 
 - **D1**：维护文件持久化 phase——`BEGIN IMMEDIATE` 成功后写 `TX_OPEN`；`INSERT running` 之后、`COMMIT` 之前写 `COMMIT_ATTEMPTED`；`success` 收尾后写 `COMMITTED`；仅进程存活且异常收尾成功时写 `UNKNOWN`（原子写 + fsync + 回读，nonce 不变）。
-- **D2**：启动中断分类——先按 §3.3 真实 `flock` 探测迁移锁：被持有 ⇒ 拒绝启动；锁空闲且维护文件 `maintenance=true` ⇒ 上一进程已死亡，按“最后落盘 phase + 实际 DB 行”判 `RECOVERY_REQUIRED`（详见下表）。
-- **D3**：重启即封锁——`RECOVERY_REQUIRED`/`ACTIVE` 时在 `init_db()`、调度器和 HTTP 监听之前封锁写入并确认，业务写 503。
+- **D2**：启动中断分类——先按 §3.3 的真实 `flock` 探测进程生命周期锁：被持有 ⇒ 拒绝启动；锁空闲且维护文件 `maintenance=true` ⇒ 上一进程已死亡，按“最后落盘 phase + 实际 DB 行”判 `RECOVERY_REQUIRED`（详见下表）。
+- **D3**：重启即封锁——启动态 `RECOVERY_REQUIRED`（启动时不接受任何合法 ACTIVE）在 `init_db()`、调度器和业务 HTTP 监听之前封锁写入并确认，业务写 503。
 
 **phase 不代表数据库行集合**：真实顺序为 `BEGIN` → 持久化 `TX_OPEN` → `INSERT running`（未提交）→ 持久化 `COMMIT_ATTEMPTED` → `COMMIT` → 置 `success`。`COMMIT_ATTEMPTED` 与 `COMMIT` 之间可被 SIGKILL，崩溃回滚使 DB 仅剩基线行。因此重启必须只读 DB，按四类行集合 + 兜底组合判定：
 
@@ -2042,7 +2042,7 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | 基线 + `running` | `COMMIT_ATTEMPTED` | `RECOVERY_REQUIRED`（`committed_not_finalized`）；禁止重跑迁移 |
 | 基线 + `success` | `COMMIT_ATTEMPTED` / `COMMITTED` | `RECOVERY_REQUIRED`（`success_pending_release`）；人工确认后按成功收尾 |
 | 基线 + `failed` | `TX_OPEN` / `COMMIT_ATTEMPTED` / `TX_ROLLED_BACK` | `RECOVERY_REQUIRED`（`migration_failed`）；走 `import --recover` |
-| 其他任意组合 | 任意 | `RECOVERY_REQUIRED`（`unclassified_state`）；保守封锁，禁止自动解封 |
+
 
 锁被持有 ⇒ 拒绝启动（`already_running`）；维护文件缺失但 DB 有 `running`/`failed` ⇒ `RECOVERY_REQUIRED`。`TX_ROLLED_BACK` 不代表 `failed` 行已写入：T2 失败或崩溃时 DB 仅基线，仍必须 `RECOVERY_REQUIRED`。R4-b 必须用真实 SIGKILL + 维护文件/DB/CLI 三份外部证据断言，禁止 mock；D1–D3 未批准前 R3/R4-b 不得标记通过。
 
@@ -2065,6 +2065,68 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | 部署约束 | 同一 `DATA_DIR` 必须对应同一 `STATE_DIR`；禁止两个实例用不同 `STATE_DIR` 指向同一数据库 |
 
 
+**R4-a 测试同步屏障（仅测试）**：在 `TX_ROLLED_BACK` 落盘后、T2 前，`NODEPOOL_TEST_MODE=1` 且 `NODEPOOL_TEST_BARRIER=r4a_after_tx_rolled_back` 时写 `<STATE_DIR>/p18-r4a.reached` 并等待 release；测试确认 phase 后执行 SIGKILL；60s 无 release 则退出码 70，不继续 T2。关闭时零文件 I/O、零等待，正式事务语义不变。未启用测试模式却设置 barrier ⇒ `test_barrier_forbidden`。
+
+**分类兜底规则（任一命中即 `RECOVERY_REQUIRED`，禁止自动解封）**：
+
+| 编号 | 条件 | 码 |
+| --- | --- | --- |
+| F-1 | phase 不在已知集合（空值/拼写/类型错误） | `phase_unknown` |
+| F-2 | 已知 phase 与 DB 行集合不构成合法配对（如 `PREPARED`+基线+running、`COMMITTED`+仅基线、`TX_OPEN`+基线+success） | `state_mismatch` |
+| F-3 | 维护文件 `CORRUPT`/`UNREADABLE`/JSON 非法/字段缺失或类型错/严格布尔失败/结构不自洽 | `maintenance_invalid`（细分 `maintenance_corrupt`/`maintenance_unreadable`） |
+| F-4 | DB 行集合不属于 `{DB_ABSENT, 仅基线, 基线+running, 基线+success, 基线+failed}`（重复基线、未知 version、多 running、success+failed 并存等） | `db_rows_unexpected` |
+| F-5 | 无法建立可信对应（查询失败、表存在性/`migration_id/version/seq` 冲突、WAL 读取不可信、连接状态不一致） | `probe_unverifiable` |
+| F-6 | `flock` 不可用（`ENOLCK`/`EOPNOTSUPP`） | `migration_lock_unsupported`，启动失败 |
+
+分类必须返回 `{state, code, phase, db_rows, detail}`，异常一律转 `RECOVERY_REQUIRED`，不得落到 `INACTIVE`。
+
+**D2 入口闭环（选择 B，离线 CLI）**：
+
+P-1.8 不提供应用内迁移接口；同一 `STATE_DIR` 单应用实例，迁移/导入均在停应用后由 CLI 持锁执行。
+
+| 动作 | 入口/所有者 | 锁 | 维护文件 |
+| --- | --- | --- | --- |
+| 应用启动 | `backend.main.lifespan` 第一段 | 获取并持有到进程退出；正常关闭在 scheduler/engine 停止后释放 | 不写 |
+| 迁移 | `cli run --apply` → `_migration_session()` | 命令开始获取 | `_migration_session()` 写 `PREPARED` 并回读确认 |
+| `migrate.run()` | 仅被 CLI 调用 | 复用 CLI 令牌，禁止二次 `flock` | 只改 phase，不建/删维护文件 |
+| 导入 | `cli import --recover` | 命令开始获取 | `_import()` 写 `manual_import` 并回读 |
+| 应用运行中执行 CLI | 同上 | `EWOULDBLOCK` ⇒ `already_running`，退出码 2 | 不写、不执行 |
+| 迁移成功 | CLI `_finish_migration_success()` | 命令结束释放 | 复核 DB → 删文件 → fsync → 回读 `INACTIVE` → `gate.release()` |
+| 迁移失败 | CLI 不清理 | 进程退出释放 | 保持文件；重启按 phase+DB 判 `RECOVERY_REQUIRED` |
+| 导入成功 | `_clear_maintenance_and_release()` | 命令结束释放 | 删文件 → 复核 → 解封 |
+| 导入失败 | CLI 不清理 | 进程退出释放 | 保持文件与封锁语义；重启判 `RECOVERY_REQUIRED` |
+
+前置：`run --apply` 必须依次完成取锁 → 写 `PREPARED` → 回读确认 → `gate.apply_state(ACTIVE)` → `pool.block_writes` → `confirm_writes_blocked`，任一失败不进入迁移事务。
+
+**D3 启动顺序（应用进程）**：
+
+| 步 | 动作 | 写库 | 失败 |
+| --- | --- | --- | --- |
+| 1 | 获取进程生命周期锁 | 否 | `already_running`，退出码 2，不绑定端口 |
+| 2 | 严格读取/校验维护文件 | 否 | 损坏/不可读/非法 ⇒ 后续 `RECOVERY_REQUIRED` |
+| 3 | 无条件写封锁（`gate` + `pool` + 确认） | 否 | 确认失败 ⇒ 退出 |
+| 4 | 只读探测 `schema_migrations`（`mode=rw`+`query_only=1`，库缺失只记 `DB_ABSENT`） | 否 | 异常 ⇒ `RECOVERY_REQUIRED` |
+| 5 | phase+DB 分类（下表合法配对 + 兜底规则） | 否 | 未定义/不匹配 ⇒ `RECOVERY_REQUIRED` |
+| 6 | 仅 `INACTIVE`：解封 → `init_db()` → 调度器/引擎 → 业务 HTTP 监听 | 是 | 初始化失败按启动失败处理 |
+| 7 | `RECOVERY_REQUIRED`（启动后不存在合法 ACTIVE）：保持封锁，不 `init_db`、不启调度器、不启业务 HTTP；仅允许独立只读诊断监听 | 否 | 持续保持，等人工恢复 |
+
+**启动分类结果（与实施计划 §8.7.1 同步）**：
+
+| 条件 | 结果 |
+| --- | --- |
+| 维护文件 ABSENT + `DB_ABSENT` | `INACTIVE`（`first_deploy`） |
+| 维护文件 ABSENT + 仅基线 | `INACTIVE`（`db_clean_no_maint`） |
+| 维护文件 ABSENT + 基线+success | `INACTIVE`（`db_migrated_no_maint`） |
+| `maintenance=false` 且字段合法 + phase COMMITTED + 基线+success | `INACTIVE`（`maint_released_db_success`） |
+| `maintenance=true`（锁已取得） | `RECOVERY_REQUIRED`（`stale_maintenance`） |
+| phase+DB 为 PREPARED/仅基线、TX_OPEN/仅基线、TX_ROLLED_BACK/仅基线、TX_OPEN 或 COMMIT_ATTEMPTED/基线+failed、TX_ROLLED_BACK/基线+failed、COMMIT_ATTEMPTED/基线+running、COMMIT_ATTEMPTED 或 COMMITTED/基线+success、UNKNOWN/任意 | `RECOVERY_REQUIRED`（对应码同计划 §8.7.1） |
+| 其余任何组合 | 命中 F-1…F-6，`RECOVERY_REQUIRED` 或 `migration_lock_unsupported` |
+
+运行中的 ACTIVE 仅存在于 CLI 迁移会话（应用已停），由 D2 入口闭环保持封锁；应用启动不产生合法 ACTIVE。
+
+**只读恢复判定与 init_db 分离**：探测连接使用 `mode=rw` 仅为读取 WAL 未 checkpoint 页，随后 `PRAGMA query_only=1`，DB 内容零写入；探测连接不得执行任何 DDL/DML，不得调用 `init_db()`/`ensure_schema_table_transactional()`/`record_baseline()`；业务初始化只在分类 `INACTIVE` 后执行。`PRESENT maintenance=true` 且锁已取得 ⇒ `stale_maintenance` → `RECOVERY_REQUIRED`，不得当成运行中的 ACTIVE。
+
+
 **前置条件**：P-1.7 已验收（`a62aeb2`）；P-1.3–P-1.6 回归全绿；独立 bridge 网络、独立端口 8089、独立 bind 目录与 `STATE_DIR`、禁用自动重启；测试库为离线副本或同构合成库，禁止挂载生产目录；仅在测试目录验证 `os.replace`/`fsync`；记录镜像 digest 与 `config.VERSION`。
 
 **验收标准**：R1–R8（含 R4-a…d）全通过并留存日志；`T_mig`≤60s；迁移后逐表计数与备份元信息一致；中断/失败路径 fail-closed（503 + 维护态保持 + 无自动恢复）；回滚后逐表数据与迁移前备份一致；文档与实测一致。
@@ -2075,4 +2137,4 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 
 **与 P-1.7 的关系**：P-1.7 的备份/导入/维护保护是本阶段的被验证对象，不因本阶段改写；P-1.8 不新增自动恢复机制，回滚一律走 `cli import` 手动路径。
 
-**v1.10 到此结束。** 二十四次修订合计**未编写代码、未执行迁移、未修改数据库、未修改生产配置或生产数据**；前十九次修订累计只处理"五项 + 两项 + 三项 + S2 异常保护 + 路径与关闭接口一致性 + β′ 跨重启证据 + 证据写入路径 + 证据完整性 + 提交结果确认 + 转换级分派与 phase 落地窗口 + halt 上行传递 + C 类不降级与 halt 故障安全 + 语义统一与 maintenance 持久化一致性 + 裸 bool 清理、维护态单一来源与自检去 assert + 维护态读取者职责分离 + 维护态三态判定在统一入口闭环、判定与写入确认分离 + 维护文件读取分类四态化（缺失/损坏/不可读严格区分）+ false 分支结构校验前置、since 有限正数严格化、since 整数/浮点分治（超大整数不触发 OverflowError、结构检查不抛出）"的状态机与伪代码矛盾；第 20 次修订改 P-1.8 阶段定义（生产窗口 → Docker 迁移演练与交付验证，见 §12）；第 21 次修订补 R4 授权恢复路径、迁移内容定义、计时口径与生产表述清理；第 22 次修订明确源库统一为 B 状态（迁移事务零 DDL）、新增 `docker kill` 持久证据缺口与 D1–D3 设计补充；第 23 次修订修正 `COMMIT_ATTEMPTED` 不得推断 `running` 行、重启按 DB 四类实际结果判定、SIGKILL 不写 `UNKNOWN`、R4-a 改为零 DDL 写行失败、补全 D2 `flock` 锁协议；第 24 次修订补 R4-a 的 T1/T2 事务边界与 `TX_ROLLED_BACK`+仅基线崩溃窗口、D2 明确选择 B（`STATE_DIR` 单应用实例、进程生命周期锁、迁移锁令牌复用、FD 继承防护），不涉及代码与 P-1.7 已验收内容。**C11–C20 全部未确认，C12 仍未被本轮视为已批准。** 文档交回总体设计最终审查；未获批准前不提交 P-1 实施计划、不进入任何实施阶段。
+**v1.10 到此结束。** 二十五次修订合计**未编写代码、未执行迁移、未修改数据库、未修改生产配置或生产数据**；前十九次修订累计只处理"五项 + 两项 + 三项 + S2 异常保护 + 路径与关闭接口一致性 + β′ 跨重启证据 + 证据写入路径 + 证据完整性 + 提交结果确认 + 转换级分派与 phase 落地窗口 + halt 上行传递 + C 类不降级与 halt 故障安全 + 语义统一与 maintenance 持久化一致性 + 裸 bool 清理、维护态单一来源与自检去 assert + 维护态读取者职责分离 + 维护态三态判定在统一入口闭环、判定与写入确认分离 + 维护文件读取分类四态化（缺失/损坏/不可读严格区分）+ false 分支结构校验前置、since 有限正数严格化、since 整数/浮点分治（超大整数不触发 OverflowError、结构检查不抛出）"的状态机与伪代码矛盾；第 20 次修订改 P-1.8 阶段定义（生产窗口 → Docker 迁移演练与交付验证，见 §12）；第 21 次修订补 R4 授权恢复路径、迁移内容定义、计时口径与生产表述清理；第 22 次修订明确源库统一为 B 状态（迁移事务零 DDL）、新增 `docker kill` 持久证据缺口与 D1–D3 设计补充；第 23 次修订修正 `COMMIT_ATTEMPTED` 不得推断 `running` 行、重启按 DB 四类实际结果判定、SIGKILL 不写 `UNKNOWN`、R4-a 改为零 DDL 写行失败、补全 D2 `flock` 锁协议；第 24 次修订补 R4-a 的 T1/T2 事务边界与 `TX_ROLLED_BACK`+仅基线崩溃窗口、D2 明确选择 B（`STATE_DIR` 单应用实例、进程生命周期锁、迁移锁令牌复用、FD 继承防护），不涉及代码与 P-1.7 已验收内容。第 25 次修订补 R4-a 测试同步屏障、分类兜底 F-1…F-6、D2 入口与维护责任闭环、D3 启动严格顺序（先封锁再只读探测，INACTIVE 前不 `init_db`），不涉及代码与 P-1.7 已验收内容。**C11–C20 全部未确认，C12 仍未被本轮视为已批准。** 文档交回总体设计最终审查；未获批准前不提交 P-1 实施计划、不进入任何实施阶段。
