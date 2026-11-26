@@ -15,6 +15,8 @@
 
 **八次修订（Evidence Integrity Closure）**：① `token_fp` 改为 `system_events` 独立列并接入真实 `INSERT` 与 β′ 校验；② `tx_local` 拆到 `migration_tx_notes`，消除与 DDL 的 3 列 INSERT 冲突；③ `write_event` 在 `BEGIN IMMEDIATE` 内做 C1–C8 全链校验后再追加；④ 路径 α/β′ 均在 `set_phase` 前执行 `hist_gate`（`s5_failed_ever` 永久禁止 T7/T8）。改动点见 §0.7。
 
+**十九次修订（Final Edge-Case Fix）**：抽出 `since_sane()`，`int` 与 `float` 分开判定——`int` 只判 `v > 0`（不调 `math.isfinite`，避免 `10**1000` 触发 `OverflowError`），`float` 才要求 `isfinite ∧ >0`；`maint_fields_sane()` 外层加 `try/except → False`，结构检查永不抛出。MC68 增 (p) 超大整数边界。改动点见 §0.10。
+
 **十八次修订（Final Review Fix）**：`maintenance_state()` 重排为 PRESENT → 布尔 → `maint_fields_sane()` → 分支，`maintenance:false` 不再绕过结构校验；`since` 增加 `math.isfinite()`，排除 `bool`/`NaN`/`±Inf`/`0`/负数；查库分支抽成 `judge_by_migration_rows()`（仅 `ABSENT` 与"合法 false"调用）。MC68 补 (m)(n)(o) 与 PermissionError 注入，逐夹具断言查库次数。改动点见 §0.10。
 
 **十七次修订（Final Blocking Fix）**：`read_maint_file()` 改为四态读取（`ABSENT`/`PRESENT`/`CORRUPT`/`UNREADABLE`），只有 `FileNotFoundError` 才算"明确不存在"；权限错误与其他 I/O 异常一律 `UNREADABLE`，不得伪装成缺失；`maintenance` 只认 JSON 真布尔，`"false"`/`0`/`null`/键缺失均为非法；顶层必须是对象。判定矩阵扩为十行并新增“是否查库”列。改动点见 §0.10。
@@ -149,6 +151,8 @@
 | 十八次 结构校验前置 | §2.1 `maintenance_state()` 重排：PRESENT → 布尔 → `maint_fields_sane()` → 才分支；查库抽成 `judge_by_migration_rows()` | `false` 不再绕过结构校验 |
 | 十八次 `since` 数值严格 | §2.1 `maint_fields_sane()` 加 `math.isfinite()` + `>0` + `type in (int,float)` | 排除 `bool`/`NaN`/`±Inf`/`0`/负数 |
 | 十八次 MC68 补夹具 | §2.5 MC68 新增 (m)(n)(o)、PermissionError 注入要求、逐夹具查库次数断言 | 查库次数成为可断言量 |
+| 十九次 int/float 分治 | §2.1 抽出 `since_sane()`：`int` 只判 `>0`、`float` 才 `isfinite ∧ >0`；`maint_fields_sane()` 加 `try/except → False` | 超大整数不再触发 `OverflowError` |
+| 十九次 MC68(p) | §2.5 新增 `10**1000` / `-10**1000` / `10**1000+10**1000`，`true`/`false` 双向 | 边界值成为夹具 |
 
 ### 0.3 四次修订改动点（S2 异常保护）
 
@@ -840,18 +844,35 @@ def read_maint_file() -> MaintReadResult:
 
 _MISSING = object()                                 # 区分"键不存在"与"键值为 null"
 
+def since_sane(v) -> bool:
+    """since 数值检查：int 与 float 分开处理，避免对超大整数调用 math.isfinite（会 OverflowError）。
+    - type(v) is int   ：整数天然有限，只判符号（含 10**1000 这类任意精度大整数）
+    - type(v) is float ：必须 isfinite ∧ > 0（排除 NaN/±Inf/0/负数）
+    - 其他类型一律非法，bool 因 type 是 bool 被排除
+    本函数绝不抛出：任何数值异常都收敛为 False。"""
+    if type(v) is int:
+        return v > 0                                # 不做位宽/范围判断，不做 isfinite
+    if type(v) is float:
+        try:
+            return math.isfinite(v) and v > 0
+        except (OverflowError, ValueError, TypeError):
+            return False                            # 防御：异常不得冒泡
+    return False
+
 def maint_fields_sane(blob) -> bool:
     """结构自洽校验：**maintenance 为 True 或 False 都必须先过这一关**，不接受近似判断。
     - migration_id：非空 str
-    - since：正的有限数值（int/float；bool 被 type 排除；NaN/±Inf 被 isfinite 排除）
+    - since：正的有限数值（int 走符号判、float 走 isfinite 判，见 since_sane）
     - phase：str 且 ∈ PHASE_NAMES
-    任一不满足即视为结构不自洽，调用方直接 RECOVERY_REQUIRED 且不查库。"""
-    mid, since, phase = (blob.get("migration_id"), blob.get("since"), blob.get("phase"))
-    return (isinstance(mid, str) and mid.strip() != ""
-            and type(since) in (int, float)          # bool 的 type 是 bool，天然被排除
-            and math.isfinite(since)                 # NaN / +Inf / -Inf 一律非法
-            and since > 0
-            and isinstance(phase, str) and phase in PHASE_NAMES)
+    任一不满足即视为结构不自洽，调用方直接 RECOVERY_REQUIRED 且不查库。
+    整个函数**只返回 True/False，不抛出**（含 OverflowError）。"""
+    try:
+        mid, since, phase = (blob.get("migration_id"), blob.get("since"), blob.get("phase"))
+        return (isinstance(mid, str) and mid.strip() != ""
+                and since_sane(since)
+                and isinstance(phase, str) and phase in PHASE_NAMES)
+    except Exception:                               # 最后一道：结构检查永不冒泡
+        return False
 
 def migration_incomplete() -> bool:
     """唯一允许的"读 DB 判断迁移是否未完成"实现（五个读取者不得各写一份）。
@@ -972,7 +993,8 @@ def set_phase(rec, new, reason) -> PhaseResult:
 | `PRESENT` | 同上 | 存在任一 `status <> 'success'` | `RECOVERY_REQUIRED` | 是（1 次） |
 | `PRESENT` | 可解析 ∧ 顶层对象 ∧ `maintenance` 为 `"false"` / `"true"` / `0` / `1` / `null` / 键缺失（非布尔） | **不查** | `RECOVERY_REQUIRED` | 否 |
 | `PRESENT` | `maintenance` 为 `true` **或** `false`，但 `migration_id` 空/非 str | **不查**（结构不自洽） | `RECOVERY_REQUIRED` | 否 |
-| `PRESENT` | `maintenance` 为 `true` 或 `false`，但 `since` 类型错（str/bool/null）、`0`、负数、`NaN`、`±Inf` | **不查** | `RECOVERY_REQUIRED` | 否 |
+| `PRESENT` | `maintenance` 为 `true` 或 `false`，但 `since` 类型错（str/bool/null）、`0`、负数、`NaN`、`±Inf`、`-10**1000` | **不查** | `RECOVERY_REQUIRED` | 否 |
+| `PRESENT` | `maintenance` 为 `true` 或 `false`，`since` 为**超大正整数**（如 `10**1000`） | 见分支 | 结构合法 ⇒ `true`→`ACTIVE`(0 次) / `false`→查库 1 次 | `true` 否 / `false` 是 |
 | `PRESENT` | `maintenance` 为 `true` 或 `false`，但 `phase` 缺失、非 str、或不在 `PHASE_NAMES` | **不查** | `RECOVERY_REQUIRED` | 否 |
 | `CORRUPT` | 截断 JSON / 非 UTF-8 / 顶层为数组·字符串·数字·`null` | **不查**（损坏≠缺失） | `RECOVERY_REQUIRED` | 否 |
 | `UNREADABLE` | 存在但 `EACCES`/`EIO`/`EBUSY`/路径是目录/网络盘断连 | **不查**（存在性未知，不得当缺失） | `RECOVERY_REQUIRED` | 否 |
@@ -984,7 +1006,7 @@ def set_phase(rec, new, reason) -> PhaseResult:
 >
 > **严格布尔约定**：`maintenance` 只认 JSON 的 `true` / `false`（Python `type(v) is bool`）。字符串 `"false"`/`"true"`、数字 `0`/`1`、`null`、键缺失一律视为非法 ⇒ `RECOVERY_REQUIRED`，禁止用 `blob.get(...)` 的真值性代替类型判断，也禁止对非 `dict` 顶层调用 `.get()`。
 >
-> **数值约定**：`since` 只认正的**有限**数值——`type(since) in (int, float)` 排除 `bool`/`str`/`null`，`math.isfinite(since)` 排除 `NaN` 与 `±Infinity`，`since > 0` 排除 `0` 与负数。三者缺一即结构不自洽。
+> **数值约定**：`since` 只认正的**有限**数值，且 int 与 float **分开判定**——`type(v) is int` 时整数天然有限，只判 `v > 0`（**不调用 `math.isfinite`**，否则 `10**1000` 这类任意精度整数会触发 `OverflowError`）；`type(v) is float` 时才要求 `math.isfinite(v) ∧ v > 0`；其余类型（含 `bool`、`str`、`null`）一律非法。`since_sane()` 与 `maint_fields_sane()` **都不抛出**，任何数值异常收敛为 `False`。
 
 **判定与写入确认严格分离（本轮定稿）**
 
@@ -1283,7 +1305,7 @@ elif rec.phase == Phase.UNKNOWN:               # 路径 α 或 β′
 | MC64 | ① 持久化成功但回读失败（改 `nonce` / 改 `phase` / 截断文件） ② 持久化失败（`os.replace` 抛错 / 目录只读）且回读失败 | 分别验证 | 两种都 `maintenance_ok=False`、不误报成功、不返回虚假 `HALTED`；封锁确认后 `fatal_exit("maintenance_unconfirmed")`；封锁无法确认则 `fatal_lockdown` + `fatal_exit("writes_block_unconfirmed")`；`guard_log` 降级链有效（文件失败 → stderr 有输出）；halt 之后数据库写入次数 == 0（连接级计数） |
 | MC65 | 遍历当前有效接口：`write_event`、`emit_event`、`append_reason` 的返回类型；`set_phase` 的返回类型；A/B/C/L 四类结果的映射 | 类型断言 + 映射表比对 + 真实 DB | 前三者返回 `WriteOutcome`（非 `bool`、非 `None`）；`set_phase` 返回 `PhaseResult`；A→`COMMITTED`→`SUCCESS`、B→`ABSENT`→`REJECTED`、C→`UNRESOLVED`→`HALTED`、L 仅 tx_local；全文当前有效伪代码中无 `return True/False`（静态扫描 `write_event`/`emit_event`/`append_reason`/`set_phase` 函数体）；`REJECTED` 出现处不含 C 路径 |
 | MC66 | 分四部分验证：(1) 唯一来源：五个直接读取者共用同一入口；(2) 次级封锁：连接池、`halt_tail`、库层约束/巡检；(3) DB 唯一性；(4) **文件缺失时的保守恢复判定路径** | 静态扫描 + 运行断言 + DB 检索 + 删文件实验 + 断库实验 | (1) 五处都只调 `maintenance_state()`，其内部只调一份 `migration_incomplete()`；无第二套判据（无 `exists()` 单独判定、无各处自写 SQL）；(2) 连接池维护期为 `dead`、`checkout` 抛 `PoolClosed`；`halt_tail` 在 `maintenance_ok`/`writes_blocked` 任一为假时**不返回**（`fatal_exit`）；库层约束与巡检仍生效（`foreign_key_check` 可发现违规）；(3) 17 张基准表 + 设计新增表中检索 `maintenance`/`maint` 表列 **0 命中**；`schema_migrations` 仅 `success` 行，无维护态字段；(4) 判定路径逐条见下方“MC66(4) 实际判定路径” |
-| MC68 | 读取分类 + 结构校验 + 三态判定 + “判定 ≠ 写入确认”分离。**正向**：(a) `maintenance:true` 全字段合法；(m) `maintenance:false` 全字段合法 + DB 全 `success`；(d) `maintenance:false` 全字段合法 + DB 有非 `success`。**缺失/异常**：(b) 真缺失 + DB 全 `success`；(c) 真缺失 + DB 有 `status<>'success'`；(f) 真缺失 + DB 查询抛错；(g) 截断 JSON（`{"maintenance":tr`）；(h) 合法 JSON 顶层为 `[]`/`"x"`/`42`/`null`；(i) `maintenance` 为 `"false"`/`"true"`/`0`/`1`/`null`/键缺失；(j) `PermissionError` **异常注入**（必选）+ `chmod 000`（非 root 环境补充）+ 制造 `IsADirectoryError` 路径。**结构不自洽（true 与 false 两套各跑一遍，DB 一律全 `success`）**：(e) `migration_id` 缺失/空 str/非 str；(n) `since` 为 `"1700000000000"`(str)/`true`(bool)/`null`/`0`/`-1`/`NaN`/`Inf`/`-Inf`；(o) `phase` 缺失/非 str/不在 `PHASE_NAMES`。**对照**：(k) 真删除 + DB 全 `success`；(l) 真删除 + DB 非 `success`。另在 halt 内注入 `set_maintenance()` 抛错而 DB 有非 `success` 行 | 运行断言 + 异常注入（monkeypatch `Path.read_bytes`）+ 查库计数器 | (a) `ACTIVE`，查库 **0**；(m) `INACTIVE`，查库 **1**；(d) `RECOVERY_REQUIRED`，查库 **1**；(b) `INACTIVE`，查库 **1**（静态证明该结论来自 `migration_incomplete()`：删掉该次查询代码后无法产出 `INACTIVE`）；(c) `RECOVERY_REQUIRED`，查库 **1**；(f) `RECOVERY_REQUIRED`，查库 **1**（抛出即失败）；(e)(n)(o) `RECOVERY_REQUIRED`，查库 **0**——且 `maintenance:true` 与 `false` 两种取值下各跑一遍，结果相同，证明结构校验先于分支、与布尔值无关；(g)(h)(i) 一律 `RECOVERY_REQUIRED`、查库 **0**，`read_maint_file().status` 依次为 `CORRUPT`/`CORRUPT`/`PRESENT`(非布尔)，均**不是** `ABSENT`；(j) `PermissionError` 注入 ⇒ `status=UNREADABLE`、`RECOVERY_REQUIRED`、查库 **0**（断言依据是注入桩抛 `PermissionError` 后的返回值，不依赖 `chmod` 生效，因 root 下 `chmod 000` 仍可读）；`IsADirectoryError` 路径同样 `UNREADABLE`、查库 **0**；(k)=(b)、(l)=(c)，证明真缺失路径未被反向夹具污染；五入口对所有夹具结果完全一致、`maintenance_state()` 返回 `MaintState` 无裸 `True/False`；halt 注入仍 `fatal_exit("maintenance_unconfirmed")`、`rec.maintenance_ok=False`、DB 写入计数 **0** |
+| MC68 | 读取分类 + 结构校验 + 三态判定 + “判定 ≠ 写入确认”分离。**正向**：(a) `maintenance:true` 全字段合法；(m) `maintenance:false` 全字段合法 + DB 全 `success`；(d) `maintenance:false` 全字段合法 + DB 有非 `success`。**缺失/异常**：(b) 真缺失 + DB 全 `success`；(c) 真缺失 + DB 有 `status<>'success'`；(f) 真缺失 + DB 查询抛错；(g) 截断 JSON（`{"maintenance":tr`）；(h) 合法 JSON 顶层为 `[]`/`"x"`/`42`/`null`；(i) `maintenance` 为 `"false"`/`"true"`/`0`/`1`/`null`/键缺失；(j) `PermissionError` **异常注入**（必选）+ `chmod 000`（非 root 环境补充）+ 制造 `IsADirectoryError` 路径。**结构不自洽（true 与 false 两套各跑一遍，DB 一律全 `success`）**：(e) `migration_id` 缺失/空 str/非 str；(n) `since` 为 `"1700000000000"`(str)/`true`(bool)/`null`/`0`/`-1`/`NaN`/`Inf`/`-Inf`；(p) `since` 为超大整数 `10**1000`（及 `-10**1000`、`10**1000 + 10**1000`），`maintenance` 取 `true`/`false` 各跑一遍；(o) `phase` 缺失/非 str/不在 `PHASE_NAMES`。**对照**：(k) 真删除 + DB 全 `success`；(l) 真删除 + DB 非 `success`。另在 halt 内注入 `set_maintenance()` 抛错而 DB 有非 `success` 行 | 运行断言 + 异常注入（monkeypatch `Path.read_bytes`）+ 查库计数器 | (a) `ACTIVE`，查库 **0**；(m) `INACTIVE`，查库 **1**；(d) `RECOVERY_REQUIRED`，查库 **1**；(b) `INACTIVE`，查库 **1**（静态证明该结论来自 `migration_incomplete()`：删掉该次查询代码后无法产出 `INACTIVE`）；(c) `RECOVERY_REQUIRED`，查库 **1**；(f) `RECOVERY_REQUIRED`，查库 **1**（抛出即失败）；(e)(n)(o) `RECOVERY_REQUIRED`，查库 **0**——且 `maintenance:true` 与 `false` 两种取值下各跑一遍，结果相同，证明结构校验先于分支、与布尔值无关；(p) `since=10**1000` 结构校验 **通过**（`since_sane()` 只判 `>0`，不调 `isfinite`），无 `OverflowError` 抛出：`true` ⇒ `ACTIVE`、查库 **0**；`false` 且其余字段合法 ⇒ 查库 **1** 次并得 `INACTIVE`（DB 全 `success`）；`false` 且 `migration_id` 非法 ⇒ 结构失败、查库 **0**；`-10**1000` 与 `0` 仍 `RECOVERY_REQUIRED`；(g)(h)(i) 一律 `RECOVERY_REQUIRED`、查库 **0**，`read_maint_file().status` 依次为 `CORRUPT`/`CORRUPT`/`PRESENT`(非布尔)，均**不是** `ABSENT`；(j) `PermissionError` 注入 ⇒ `status=UNREADABLE`、`RECOVERY_REQUIRED`、查库 **0**（断言依据是注入桩抛 `PermissionError` 后的返回值，不依赖 `chmod` 生效，因 root 下 `chmod 000` 仍可读）；`IsADirectoryError` 路径同样 `UNREADABLE`、查库 **0**；(k)=(b)、(l)=(c)，证明真缺失路径未被反向夹具污染；五入口对所有夹具结果完全一致、`maintenance_state()` 返回 `MaintState` 无裸 `True/False`；halt 注入仍 `fatal_exit("maintenance_unconfirmed")`、`rec.maintenance_ok=False`、DB 写入计数 **0** |
 | MC67 | 注入四种坏分派表：① 键集合与 `LEGAL_TRANSITIONS` 不一致 ② T1 或 T2 标成 `durable` ③ T6/T7/T8 任一标成 `tx_local` ④ 出现未知后端值 `"xxx"`；分别在**普通模式**与 `python -O` 下运行启动自检 | 观察 `start_migration()` 返回值 | 四种 × 两模式**全部拒绝启动**（`DispatchTableBroken` 抛出并落 `dispatch_table_broken` 文件日志、`exit_code=EXIT_CONFIG`、`start_migration()` 返回 False）；两模式结果**逐项一致**（不因 `-O` 而放行）；正常分派表在两模式下均通过 |
 
 **MC66(4) 实际判定路径（本轮定稿，逐跳可复现）**
@@ -1866,7 +1888,9 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | 损坏 ≠ 缺失 | `CORRUPT`/`UNREADABLE` 直接 `RECOVERY_REQUIRED`、不查库；仅 `ABSENT` 可查库 | §2.1 `MaintRead` / 矩阵 | MC68(g)(h)(j) |
 | 严格布尔 | `maintenance` 只认 JSON `true`/`false`；`"false"`/`"true"`/`0`/`1`/`null`/键缺失 ⇒ `RECOVERY_REQUIRED` | §2.1 `maintenance_state` / 布尔约定 | MC68(i) |
 | 结构校验先于分支 | `true` 与 `false` **都**先过 `maint_fields_sane()`，失败即 `RECOVERY_REQUIRED` 且不查库 | §2.1 伪代码 / 矩阵 | MC68(e)(n)(o) |
-| `since` 数值严格 | 正的有限数值：排除 `bool`/`str`/`null`/`0`/负数/`NaN`/`±Inf` | §2.1 `maint_fields_sane` | MC68(n) |
+| `since` 数值严格 | 正的有限数值：排除 `bool`/`str`/`null`/`0`/负数/`NaN`/`±Inf` | §2.1 `since_sane` | MC68(n) |
+| 整数/浮点分治 | `type is int` 只判 `>0`（不调 `isfinite`，任意精度大整数合法）；`type is float` 才 `isfinite ∧ >0` | §2.1 `since_sane` / 数值约定 | MC68(p) |
+| 结构检查不抛出 | `since_sane()` 与 `maint_fields_sane()` 只返回 `True/False`，`OverflowError` 等一律收敛为 `False` | §2.1 两个函数 | MC68(p) |
 | PermissionError 注入 | 以 `monkeypatch Path.read_bytes` 抛 `PermissionError` 为准，不依赖 `chmod`（root 下仍可读） | §2.1 `read_maint_file` | MC68(j) |
 | 顶层类型 | 非 `dict` 顶层不进入任何 `.get()` 路径 | §2.1 `read_maint_file` | MC68(h) |
 | 判定 ≠ 写入确认 | `confirm_maint_write()` 只答“我这份是否落盘”；`RECOVERY_REQUIRED` 不得替代它 | §2.1 分离表 | MC68 halt 注入 |
@@ -1956,10 +1980,11 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | 41c | 文件缺失被当成正常态，升级中断后自动开放写入 | 缺失必须经 `migration_incomplete()`；非 `success` 或查询失败 ⇒ `RECOVERY_REQUIRED` | MC66(4) / MC68 |
 | 41d | 损坏/不可读文件被当成"缺失"进而查库放行（或被当成 `ACTIVE`） | `MaintRead` 四态分离；`CORRUPT`/`UNREADABLE` 不查库直接 `RECOVERY_REQUIRED`；`maintenance` 严格布尔 | MC68(g)(h)(i)(j) |
 | 41e | `maintenance:false` 未过结构校验就直接查库，靠 DB 全 `success` 放行 | `maint_fields_sane()` 对 `true`/`false` 一律前置；失败不查库 | MC68(e)(n)(o) |
-| 41f | `since` 用真值判断（`NaN`/`Inf`/`"0"` 混过）或 `bool` 被当数字 | `type in (int,float)` + `math.isfinite` + `>0` 三重判据 | MC68(n) |
+| 41f | `since` 用真值判断（`NaN`/`Inf`/`"0"` 混过）或 `bool` 被当数字 | `since_sane()` 类型分治 + 数值判据 | MC68(n) |
+| 41g | 对超大整数调 `math.isfinite` → `OverflowError` 冒泡，`maintenance_state()` 变 500/异常退出 | int 分支不调 `isfinite`；`maint_fields_sane()` 外层兜底 `try/except → False` | MC68(p) |
 | 41b | 为"统一来源"强迫次级机制也读文件 → 职责错位、多套判据 | A/B 两类职责分离；B 类由 A 的结果驱动 | MC66(2) |
 | 42 | 启动自检被 `-O` 裁剪 → 坏分派表静默通过 | 显式 `if` + 专用异常 + 拒绝启动 | MC67 |
 
 ---
 
-**v1.10 到此结束。** 十八次修订合计**未编写代码、未执行迁移、未修改数据库、未修改生产配置或生产数据**；十八次修订累计只处理"五项 + 两项 + 三项 + S2 异常保护 + 路径与关闭接口一致性 + β′ 跨重启证据 + 证据写入路径 + 证据完整性 + 提交结果确认 + 转换级分派与 phase 落地窗口 + halt 上行传递 + C 类不降级与 halt 故障安全 + 语义统一与 maintenance 持久化一致性 + 裸 bool 清理、维护态单一来源与自检去 assert + 维护态读取者职责分离 + 维护态三态判定在统一入口闭环、判定与写入确认分离 + 维护文件读取分类四态化（缺失/损坏/不可读严格区分）+ false 分支结构校验前置与 since 有限正数严格化"的状态机与伪代码矛盾。**C11–C20 全部未确认，C12 仍未被本轮视为已批准。** 文档交回总体设计最终审查；未获批准前不提交 P-1 实施计划、不进入任何实施阶段。
+**v1.10 到此结束。** 十九次修订合计**未编写代码、未执行迁移、未修改数据库、未修改生产配置或生产数据**；十九次修订累计只处理"五项 + 两项 + 三项 + S2 异常保护 + 路径与关闭接口一致性 + β′ 跨重启证据 + 证据写入路径 + 证据完整性 + 提交结果确认 + 转换级分派与 phase 落地窗口 + halt 上行传递 + C 类不降级与 halt 故障安全 + 语义统一与 maintenance 持久化一致性 + 裸 bool 清理、维护态单一来源与自检去 assert + 维护态读取者职责分离 + 维护态三态判定在统一入口闭环、判定与写入确认分离 + 维护文件读取分类四态化（缺失/损坏/不可读严格区分）+ false 分支结构校验前置、since 有限正数严格化、since 整数/浮点分治（超大整数不触发 OverflowError、结构检查不抛出）"的状态机与伪代码矛盾。**C11–C20 全部未确认，C12 仍未被本轮视为已批准。** 文档交回总体设计最终审查；未获批准前不提交 P-1 实施计划、不进入任何实施阶段。
