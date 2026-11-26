@@ -15,6 +15,8 @@
 
 **八次修订（Evidence Integrity Closure）**：① `token_fp` 改为 `system_events` 独立列并接入真实 `INSERT` 与 β′ 校验；② `tx_local` 拆到 `migration_tx_notes`，消除与 DDL 的 3 列 INSERT 冲突；③ `write_event` 在 `BEGIN IMMEDIATE` 内做 C1–C8 全链校验后再追加；④ 路径 α/β′ 均在 `set_phase` 前执行 `hist_gate`（`s5_failed_ever` 永久禁止 T7/T8）。改动点见 §0.7。
 
+**十四次修订（Final Consistency Cleanup）**：① 清除当前有效伪代码中的裸 `True/False`（七态表 1/2/5 行、`§6.9` 内存一致性）统一为 `WriteOutcome`；② `maintenance` 存储全文统一为 `<STATE_DIR>/maintenance.json`，六个写入通道共读同一契约，DB 不存维护态；③ 分派表启动自检改显式 `if` + `DispatchTableBroken`，普通模式与 `-O` 一致拒启动。改动点见 §0.10。
+
 **十三次修订（Final Consistency Closure）**：① 全篇统一 `A→SUCCESS` / `B→REJECTED` / `C→HALTED` / `L` 仅 tx_local，清除 §1.4、§2.1、§2.5 等处的裸 `False` 与"C 归 REJECTED"残留；② `maintenance` 改为独立 `maintenance.json`（原子 rename + fsync + `verify_maintenance` 回读），未确认即 `fatal_exit`；`halt_tail` 以显式检查取代 `assert`。改动点见 §0.10。
 
 **十二次修订（Final Halt Semantics Fix）**：① `write_event` 改为返回 `WriteOutcome`（A/B/C/`LOCAL`），C 类在 `set_phase` 只映射为 `HALTED`、不重复 halt，`migration_note` 的 C 类经 `note_or_stop` 走 `halt_tail`；② `halt_migration` 三个保护动作独立异常边界，封锁须回读确认，未确认即 `fatal_lockdown` + `fatal_exit`。改动点见 §0.10。
@@ -105,7 +107,7 @@
 
 | 项 | 位置 | 改动 |
 | --- | --- | --- |
-| P0-1 分派冲突 | §2.1 `TRANSITION_DISPATCH` + `_assert_dispatch_invariants` + 重写 `emit_event` + 转换→后端表 + 三道闸 | 分派键由事件名改为合法转换 `(old,new)`；`migration_phase` 被 T1/T2 与 T4–T8 共用的问题消除；非法分派零写入、不回退默认后端 |
+| P0-1 分派冲突 | §2.1 `TRANSITION_DISPATCH` + `check_dispatch_invariants` + 重写 `emit_event` + 转换→后端表 + 三道闸 | 分派键由事件名改为合法转换 `(old,new)`；`migration_phase` 被 T1/T2 与 T4–T8 共用的问题消除；非法分派零写入、不回退默认后端 |
 | P0-2 phase 落地异常 | §2.1 `commit_phase_in_memory` + `set_phase` 两支调用 + `halt_migration` 约束；§2.2 新增两行；§2.3 新增三行 | 事件确认后 `rec.phase` 赋值抛错 ⇒ halt（不重发、不换转换、不判事件失败）；已提交事件保留为唯一事实 |
 | 测试 | §2.5 MC57–MC59、§7 计数 56→59 | 真实 SQLite 行 + 调用计数 + 日志码互斥断言 |
 
@@ -122,6 +124,10 @@
 | 十三次 P0-1 语义统一 | §1.4 T6 三分支、§2.1 三态表/语义对照表/映射口径、§2.2 表、§2.3 表、MC43/49/59 | `A→SUCCESS`、`B→REJECTED`、`C→HALTED`、`L` 仅 tx_local；裸 `False` 清零 |
 | 十三次 P0-2 maintenance 一致性 | §2.1 halt 重写 + `verify_maintenance` + 持久化契约表；§2.2 `halt_tail` 显式检查 | 未确认不返回正常 HALTED；`fatal_exit` 非零退出；不用 `assert` |
 | 测试 | §2.5 MC63–MC64、MC62 收紧、§7 计数 62→64 | 读文件回读 + DB 零写 + 退出码断言 |
+| 十四次 裸 bool 清理 | §2.1 七态表 1/2/5 行、§6.9 内存一致性行 | `WriteOutcome.ABSENT/COMMITTED` 取代 True/False |
+| 十四次 maintenance 单一来源 | §3.3 六通道表 + 唯一来源注 | 全部读 `maintenance.json`；DB 零维护态 |
+| 十四次 自检去 assert | §2.1 `check_dispatch_invariants()` + `DispatchTableBroken` + `start_migration()` | 普通/`-O` 一致拒启动 |
+| 测试 | §2.5 MC65–MC67、§7 计数 64→67 | 类型断言 + 静态扫描 + 双模式运行 |
 
 ### 0.3 四次修订改动点（S2 异常保护）
 
@@ -482,11 +488,11 @@ def write_event(rec, event, detail) -> WriteOutcome:
 
 | # | 阶段标记 | 已发生的事实 | 可否直接判定结果 | 处理 |
 | --- | --- | --- | --- | --- |
-| 1 | `CONN_OPENED` | 连接已取，`BEGIN IMMEDIATE` 尚未成功 | **确定未写入**（无事务、无 INSERT） | 直接 `False`，不回滚、不重查 |
-| 2 | `TX_OPEN` | `BEGIN IMMEDIATE` 成功，尚未 `INSERT` | **确定未写入** | 回滚即结束，`False` |
+| 1 | `CONN_OPENED` | 连接已取，`BEGIN IMMEDIATE` 尚未成功 | **确定未写入**（无事务、无 INSERT） | 直接 `WriteOutcome.ABSENT`（B），不回滚、不重查 |
+| 2 | `TX_OPEN` | `BEGIN IMMEDIATE` 成功，尚未 `INSERT` | **确定未写入** | 回滚即结束，返回 `WriteOutcome.ABSENT`（B） |
 | 3 | `INSERTING` | `INSERT` 语句已发出、未见成功返回 | **不确定**（不在设计上赌语句级原子性） | 必须重查确认 |
 | 4 | `INSERTED` | `INSERT` 返回成功，`COMMIT` 未开始/未返回 | **与 COMMIT 实际结果绑定** | 必须重查确认 |
-| 5 | `COMMITTED` | `COMMIT` 正常返回 | **确定已提交** | 直接采纳，不重查 |
+| 5 | `COMMITTED` | `COMMIT` 正常返回 | **确定已提交** | 返回 `WriteOutcome.COMMITTED`（A），不重查 |
 | 6 | `COMMITTING` | `COMMIT` 已发出、抛错 | **未知**（可能已提交、可能未） | 必须重查确认 |
 | 7 | rollback/close 抛错 | `ROLLBACK` 抛错 ⇒ 事务最终状态未知（可能已回滚、可能仍挂起）；`close` 抛错 ⇒ 提交结果未改变，但"链是否完整"无法确认 | **均不得据此推断** | 已到过 `INSERT` 就必须重查；**close 抛错绝不等价于"未提交"** |
 
@@ -606,16 +612,38 @@ TRANSITION_DISPATCH = {
     (Phase.UNKNOWN,          Phase.TX_ROLLED_BACK):    "durable",    # T8
 }
 
-# 启动时自检（缺一即视为设计/映射破损，拒绝启动迁移）
-def _assert_dispatch_invariants():
-    assert set(TRANSITION_DISPATCH) == set(LEGAL_TRANSITIONS), "分派表必须与合法转换表一一对应"
+# 启动自检：显式 if（不依赖 assert，-O 模式下行为一致），失败即拒绝启动迁移
+class DispatchTableBroken(Exception):
+    """分派表与合法转换表不一致，或关键转换后端错误；启动即失败，绝不继续迁移。"""
+
+EXPECTED_TX_LOCAL = {(Phase.PREPARED, Phase.TX_OPEN), (Phase.TX_OPEN, Phase.COMMIT_ATTEMPTED)}          # T1/T2
+EXPECTED_DURABLE  = {(Phase.TX_OPEN, Phase.TX_ROLLED_BACK), (Phase.COMMIT_ATTEMPTED, Phase.COMMITTED),   # T3/T4
+                     (Phase.COMMIT_ATTEMPTED, Phase.TX_ROLLED_BACK), (Phase.COMMIT_ATTEMPTED, Phase.UNKNOWN),
+                     (Phase.UNKNOWN, Phase.COMMITTED), (Phase.UNKNOWN, Phase.TX_ROLLED_BACK)}            # T5/T6/T7/T8
+
+def check_dispatch_invariants() -> None:
+    keys = set(TRANSITION_DISPATCH.keys())
+    if keys != set(LEGAL_TRANSITIONS):
+        raise DispatchTableBroken("keys != LEGAL_TRANSITIONS: extra=%r missing=%r"
+                                  % (keys - set(LEGAL_TRANSITIONS), set(LEGAL_TRANSITIONS) - keys))
     for k, v in TRANSITION_DISPATCH.items():
-        assert v in ("tx_local", "durable"), (k, v)
-    for k in ((Phase.PREPARED, Phase.TX_OPEN), (Phase.TX_OPEN, Phase.COMMIT_ATTEMPTED)):
-        assert TRANSITION_DISPATCH[k] == "tx_local", k          # T1/T2 必须 tx_local
-    for k in ((Phase.COMMIT_ATTEMPTED, Phase.UNKNOWN), (Phase.UNKNOWN, Phase.COMMITTED),
-              (Phase.UNKNOWN, Phase.TX_ROLLED_BACK)):
-        assert TRANSITION_DISPATCH[k] == "durable", k           # T6/T7/T8 必须 durable
+        if v not in ("tx_local", "durable"):
+            raise DispatchTableBroken("unknown backend %r for %r" % (v, k))
+    for k in EXPECTED_TX_LOCAL:
+        if TRANSITION_DISPATCH.get(k) != "tx_local":
+            raise DispatchTableBroken("T1/T2 must be tx_local: %r -> %r" % (k, TRANSITION_DISPATCH.get(k)))
+    for k in EXPECTED_DURABLE:
+        if TRANSITION_DISPATCH.get(k) != "durable":
+            raise DispatchTableBroken("T3–T8 must be durable: %r -> %r" % (k, TRANSITION_DISPATCH.get(k)))
+
+def start_migration(rec):
+    try:
+        check_dispatch_invariants()
+    except DispatchTableBroken as e:
+        non_db_log("dispatch_table_broken", e)      # 文件日志；不进入迁移
+        rec.exit_code = EXIT_CONFIG
+        return False                                # 拒绝启动（普通模式与 -O 模式一致）
+    return True
 
 def emit_event(rec, event, detail) -> WriteOutcome:
     """唯一入口。后端由合法转换表现算得出；返回 WriteOutcome，不压缩成裸 bool。"""
@@ -1020,6 +1048,7 @@ elif rec.phase == Phase.UNKNOWN:               # 路径 α 或 β′
 | C 类结果再次调用 `halt_migration` | **不允许** | `write_event` 已调用；重复调用会重复置位/重复日志，掩盖首次故障 | `halt_migration` 幂等 + `set_phase` 只做映射 |
 | maintenance 持久化失败仍返回正常 `HALTED` | **不允许** | 重启后无法识别维护态，业务写入可能恢复 | `verify_maintenance()` 回读确认；未确认 ⇒ `fatal_exit("maintenance_unconfirmed")`，非零退出 |
 | maintenance 与业务库同库存储 | **不允许** | halt 期间禁止数据库写入，同库存储会自相矛盾 | 独立 `STATE_DIR/maintenance.json`，原子 rename + fsync + 回读 |
+| 启动自检用 `assert` 承担安全校验 | **不允许** | `-O` 会裁剪 assert，坏分派表将静默通过 | 显式 `if` + `DispatchTableBroken` + `start_migration()` 拒绝启动（MC67） |
 | `halt_tail` 用 `assert` 承担前置检查 | **不允许** | 优化模式会裁剪 assert，安全检查失效 | 显式 `if not (maintenance_ok and writes_blocked)` → `fatal_lockdown` + `fatal_exit` |
 | halt 中某保护动作失败后跳过其余动作 | **不允许** | 跳过封锁会让业务写入继续可用 | 三个动作各自独立 `try`；封锁失败 → `fatal_lockdown` + `fatal_exit` |
 | 封锁未确认仍返回正常 `HALTED` | **不允许** | 返回"正常"会让上层以为已安全封锁 | `confirm_writes_blocked()` 回读确认；不成立即致命路径、非零退出 |
@@ -1045,7 +1074,7 @@ elif rec.phase == Phase.UNKNOWN:               # 路径 α 或 β′
 
 三者必须一致：`COMMITTED` 出现在内存与事件中 ⇒ `enter_phase_c` 被调用一次；事件里没有 `COMMITTED` ⇒ 内存不得为 `COMMITTED` ⇒ 未进入阶段 C ⇒ 无 success、写入仍关闭。
 
-### 2.5 测试（PH9–PH11、PH9b、PH10b + MC19–MC21 + MC38–MC64）
+### 2.5 测试（PH9–PH11、PH9b、PH10b + MC19–MC21 + MC38–MC67）
 
 | # | 初始 | 步骤 | 预期 |
 | --- | --- | --- | --- |
@@ -1084,6 +1113,9 @@ elif rec.phase == Phase.UNKNOWN:               # 路径 α 或 β′
 | MC62 | 注入 `set_maintenance()` 抛错；`block_business_writes()` 抛错；`non_db_log()` 抛错；三者同时抛错 | 观察每个动作是否仍被尝试、最终去向 | 每个动作都有独立日志码（`halt_maintenance_failed` / `halt_write_lock_failed` / `halt_log_failed`，日志自身失败再降级 stderr）；后续动作**仍被执行**；`maintenance_ok=False` 时**不得**正常返回 `HALTED`，封锁确认后仍 `fatal_exit("maintenance_unconfirmed")`；封锁未确认时 `fatal_lockdown` + `fatal_exit`；退出码非零；`halt_migration` 不抛出、不冒泡为"事件写入失败"；**零数据库写入**（连接级计数）；不返回 `SUCCESS`/`REJECTED` |
 | MC63 | `set_maintenance()` 抛错，但 `block_business_writes()` 与 `confirm_writes_blocked()` 成功 | 走完整 halt → `halt_tail` 链路；读文件、DB、退出码 | 封锁动作仍被执行且回读确认；`maintenance_ok=False`；**不返回正常 `HALTED`**（`fatal_exit("maintenance_unconfirmed")`，退出码非零）；`halt_tail` 前置检查不因 `assert` 产生未处理异常（改为显式检查 + 致命路径）；`maintenance.json` 不存在或内容不匹配时**不误报为 true**；无 `migration_note`、无第二次 `INSERT`、无 success；业务写入 503（由封锁保证） |
 | MC64 | ① 持久化成功但回读失败（改 `nonce` / 改 `phase` / 截断文件） ② 持久化失败（`os.replace` 抛错 / 目录只读）且回读失败 | 分别验证 | 两种都 `maintenance_ok=False`、不误报成功、不返回虚假 `HALTED`；封锁确认后 `fatal_exit("maintenance_unconfirmed")`；封锁无法确认则 `fatal_lockdown` + `fatal_exit("writes_block_unconfirmed")`；`guard_log` 降级链有效（文件失败 → stderr 有输出）；halt 之后数据库写入次数 == 0（连接级计数） |
+| MC65 | 遍历当前有效接口：`write_event`、`emit_event`、`append_reason` 的返回类型；`set_phase` 的返回类型；A/B/C/L 四类结果的映射 | 类型断言 + 映射表比对 + 真实 DB | 前三者返回 `WriteOutcome`（非 `bool`、非 `None`）；`set_phase` 返回 `PhaseResult`；A→`COMMITTED`→`SUCCESS`、B→`ABSENT`→`REJECTED`、C→`UNRESOLVED`→`HALTED`、L 仅 tx_local；全文当前有效伪代码中无 `return True/False`（静态扫描 `write_event`/`emit_event`/`append_reason`/`set_phase` 函数体）；`REJECTED` 出现处不含 C 路径 |
+| MC66 | 扫描全部入口：应用写入、后台任务、连接池、CLI、`write_guard()`、重启恢复、`halt_tail` | 读取文件与 DB 两侧状态 | 所有入口读同一 `<STATE_DIR>/maintenance.json`（同一路径常量、同一 `verify_maintenance()` 判据）；DB 中不存在 maintenance 状态（17 张基准表 + 设计新增表中检索 `maintenance`/`maint` 列或表：**0 命中**）；删掉文件而 DB 仍有非 success 迁移行时，入口一律按保守恢复处理、不开放写入 |
+| MC67 | 注入四种坏分派表：① 键集合与 `LEGAL_TRANSITIONS` 不一致 ② T1 或 T2 标成 `durable` ③ T6/T7/T8 任一标成 `tx_local` ④ 出现未知后端值 `"xxx"`；分别在**普通模式**与 `python -O` 下运行启动自检 | 观察 `start_migration()` 返回值 | 四种 × 两模式**全部拒绝启动**（`DispatchTableBroken` 抛出并落 `dispatch_table_broken` 文件日志、`exit_code=EXIT_CONFIG`、`start_migration()` 返回 False）；两模式结果**逐项一致**（不因 `-O` 而放行）；正常分派表在两模式下均通过 |
 
 
 ---
@@ -1226,12 +1258,14 @@ k1 = quarantined_ok and close_ok and conn_wrapper.is_closed and conn_wrapper.no_
 
 | 通道 | 手段 | 覆盖 |
 | --- | --- | --- |
-| 应用写入 | `maintenance` 标志（存 DB）→ 写入入口 503 | 所有请求线程 |
-| 后台任务 | 任务状态机 `stopped`；每轮开始复查 maintenance | 调度/检测/测速/发布 |
+| 应用写入 | 读 `<STATE_DIR>/maintenance.json`（`maintenance is True ∧ migration_id` 匹配）→ 写入入口 503 | 所有请求线程 |
+| 后台任务 | 任务状态机 `stopped`；每轮开始前重读同一 maintenance 文件 | 调度/检测/测速/发布 |
 | 连接池 | 池 `dead`，`checkout` 抛 `PoolClosed` | 池内所有连接 |
-| CLI | 写命令需 `--allow-write` 且先读 maintenance | 人工操作 |
-| 漏网进程 | `write_guard()` 读 maintenance + 两 PRAGMA，不满足即拒 | 任何走正式入口的写 |
+| CLI | 写命令需 `--allow-write` 且先读同一 maintenance 文件 | 人工操作 |
+| 漏网进程 | `write_guard()` 读同一 maintenance 文件 + 两 PRAGMA，不满足即拒 | 任何走正式入口的写 |
 | 完全绕过入口 | 库层约束（触发器/外键）+ 事后 `foreign_key_check` 与巡检 | 兜底可观测 |
+
+> **maintenance 唯一来源**：以上六个通道**全部**读取 `<STATE_DIR>/maintenance.json`（§2.1 契约：原子 rename + `fsync` + `nonce` + 回读验证）。业务 SQLite 库中**不存**任何 maintenance 状态——既不建表、不写 `settings`、也不写 `schema_migrations` 的临时标记；`schema_migrations` 里只有最终的 `success` 记录，它**不能**替代 maintenance。任何入口若读到"文件缺失"而 DB 里存在非 `success` 的迁移行，按保守恢复处理（不自动放行写入）。
 
 **关键补充（本轮）**：S5 是瞬时探测，"探测后又被别人拿到写锁"是必须处理的情形。
 
@@ -1512,16 +1546,19 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | 全链重验 | 重查时对实际持久化链重跑 `verify_full_chain`（C1–C8） |
 | 三分类 | A 采纳并推进（不重写）；B 返回失败（不推进、不动内存）；C 停 maintenance + 文件日志（不重发、不开放写入） |
 | `ROLLBACK`/`close` | 均不参与推断；`close` 抛错不等于未提交；只读连接读取失败不等于"不存在" |
-| 内存一致性 | `rec.s5_failed_ever` 仅在 `COMMIT` 返回或 A 后更新；`rec.phase` 仅在 `emit_event==True` 后更新；确认窗口内异常一律 halt |
+| 内存一致性 | `rec.s5_failed_ever` 仅在 `WriteOutcome.COMMITTED`（A）后更新；`rec.phase` 仅在 `emit_event` 返回 `WriteOutcome.COMMITTED` 后、经 `commit_phase_in_memory()` 更新；`ABSENT`/`UNRESOLVED` 一律不动；确认窗口内异常一律 halt |
 | 统一入口 | `emit_event()` 成为唯一事件入口；`set_phase`（tx_local 与 durable 两支）与 `append_reason` 都只调 `emit_event`；两个后端函数仅在 `emit_event` 内被引用 |
 | 语义不变 | 两种后端的连接、事务、失败与证据链语义一字未改；DDL/`INSERT`/哈希链/单调性/K1/S5/T6/T7/T8 条件未动 |
-| 分派冲突修复（十次） | `TRANSITION_DISPATCH[(old,new)]` 取代 `DURABILITY_OF[event]`；`migration_phase` 按转换键分派；三道闸 + 启动自检 `_assert_dispatch_invariants()` | §2.1 分派表 / 转换→后端表 | MC57 |
+| 分派冲突修复（十次） | `TRANSITION_DISPATCH[(old,new)]` 取代 `DURABILITY_OF[event]`；`migration_phase` 按转换键分派；三道闸 + 启动自检 `check_dispatch_invariants()`（十四次起改显式 if） | §2.1 分派表 / 转换→后端表 | MC57 |
 | phase 落地异常保护（十次） | `commit_phase_in_memory()` 包裹赋值；异常 ⇒ `halt_migration`（不重发、不换转换、不判事件失败） | §2.1 伪代码 / §2.2 表 / §2.3 | MC58/MC59 |
 | halt 上行传递（十一次） | `PhaseResult` 三态（`SUCCESS`/`REJECTED`/`HALTED`）取代裸 `bool`；`halt_tail` 零写入；`emit_event`/`append_reason` 在 `rec.halted` 时拒写 | §2.1 / §2.2 分派表 | MC60/MC60b |
 | C 类不降级（十二次） | `WriteOutcome`（COMMITTED/ABSENT/UNRESOLVED/LOCAL）取代裸 bool；`set_phase` 对 `UNRESOLVED` 只映射为 `HALTED`，不重复 halt；`note_or_stop` 处理 note 的 C 类 | §2.1 / §2.2 | MC61 |
 | halt 故障安全（十二次） | 三个保护动作独立 `try` + `guard_log` 三层降级 + `confirm_writes_blocked` + `fatal_lockdown`/`fatal_exit` | §2.1 halt 伪代码 + 三道拒写机制表 | MC62 |
 | A/B/C 语义统一（十三次） | 全篇统一映射；清除 §1.4「False」、§2.1 语义对照中的 False、MC43 的 False 断言 | §1.4 / §2.1 / §2.2 / §2.3 / §2.5 / §8 | MC43/MC49/MC61 |
 | maintenance 一致性（十三次） | `maintenance.json` 原子写 + `verify_maintenance` 回读；未确认即 `fatal_exit`；`halt_tail` 显式检查 | §2.1 持久化契约表 | MC63/MC64 |
+| 无裸 bool 残留（十四次） | 七态表 1/2/5 行改为 `WriteOutcome.ABSENT`/`COMMITTED`；§6.9 内存一致性改判 `COMMITTED` | §2.1 / §6.9 | MC65 |
+| maintenance 单一来源（十四次） | §3.3 六通道全部读同一 `maintenance.json`；DB 不存维护态 | §3.3 / §2.1 契约 | MC66 |
+| 启动自检不用 assert（十四次） | `check_dispatch_invariants()` 显式 if + `DispatchTableBroken` + `start_migration()` | §2.1 | MC67 |
 
 ## 7. 测试矩阵（增量）
 
@@ -1537,7 +1574,7 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | RC | 6 | 6 | — |
 | CF | 8 | 8 | — |
 | AU | 9 | 9 | — |
-| MC | 12 | **64** | +MC13–MC18；二次修订 +MC19–MC20；三次修订 +MC21、MC15b/15c/15d、MC13b；四次修订 +MC22–MC24；五次修订 +MC25/MC26/MC26b/MC27/MC27b；六次修订 +MC34–MC37；七次修订 +MC38–MC43；八次修订 +MC44–MC47；九次修订 +MC48–MC56；十次修订 +MC57–MC59；十一次修订 +MC60（含对照 MC60b）；十二次修订 +MC61–MC62；十三次修订 +MC63–MC64（MC62 语义收紧） |
+| MC | 12 | **67** | +MC13–MC18；二次修订 +MC19–MC20；三次修订 +MC21、MC15b/15c/15d、MC13b；四次修订 +MC22–MC24；五次修订 +MC25/MC26/MC26b/MC27/MC27b；六次修订 +MC34–MC37；七次修订 +MC38–MC43；八次修订 +MC44–MC47；九次修订 +MC48–MC56；十次修订 +MC57–MC59；十一次修订 +MC60（含对照 MC60b）；十二次修订 +MC61–MC62；十三次修订 +MC63–MC64（MC62 语义收紧）；十四次修订 +MC65–MC67 |
 | CR | 5 | 5 | — |
 | FX | 3 | **4** | +FX4 |
 | PH | 5 | **13** | +PH6–PH11、PH9b、PH10b |
@@ -1606,7 +1643,7 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | 事件未提交不推进 phase | B 路径 `WriteOutcome.ABSENT` → `REJECTED`，内存不动 | §2.2 表 / §2.3 | MC49/MC52 |
 | 不可读不解释为不存在 | `UNREADABLE` 属 C，停 maintenance | §2.1 三结果表 | MC50 |
 | 单一事件入口 | `set_phase` 两支 + `append_reason` 均调 `emit_event` | §2.1 / §1.2 | MC54/MC55/MC56 |
-| 分派按转换键而非事件名 | `TRANSITION_DISPATCH[(old,new)]` + `_assert_dispatch_invariants()` | §2.1 分派表 / 转换→后端表 | MC57 |
+| 分派按转换键而非事件名 | `TRANSITION_DISPATCH[(old,new)]` + `check_dispatch_invariants()` | §2.1 分派表 / 转换→后端表 | MC57 |
 | T1/T2 必进 tx_local、T6/T7/T8 必进 durable | 表值固定 + 启动自检断言 | §2.1 自检函数 | MC57 |
 | 非法分派零写入 | 三道闸 + `IllegalDurability`/`PhaseMismatch` | §2.1 闸门说明 | MC57 |
 | phase 落地异常不判事件失败 | `commit_phase_in_memory` → `halt_migration` | §2.1 伪代码 / §2.2 表 | MC58/MC59 |
@@ -1622,6 +1659,9 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | 无裸 `False` 断言残留 | 全文检索 `返回 False` 已清零（仅存于历史说明） | §2.5 / §8 | MC43 |
 | maintenance 持久化可回读 | `maintenance.json` 原子 rename + `verify_maintenance` | §2.1 契约表 | MC63/MC64 |
 | `halt_tail` 不依赖 assert | 显式检查 + `fatal_exit` | §2.2 | MC63 |
+| 当前有效伪代码无裸 bool | 七态表/内存一致性/自检全部改为枚举 | §2.1 / §6.9 | MC65 |
+| maintenance 唯一来源（文件） | §3.3 六通道 + DB 零维护态 | §3.3 / §2.1 | MC66 |
+| 自检 `-O` 与普通模式一致 | 显式 `if` + `DispatchTableBroken` | §2.1 | MC67 |
 | 独立夹具 | §4.2 | — | FX4/R10-A0/A1/A2 |
 
 **九次修订的八项全篇核对（本轮必须逐条过）**
@@ -1701,7 +1741,10 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | 37 | 旧语义残留（C 被写成 REJECTED/False）→ 实施时再次降级 | 全篇统一映射表 + 全文检索清零裸 `False` | MC43/MC61 |
 | 38 | `set_maintenance` 失败但封锁成功 → `halt_tail` 断言崩溃 | maintenance 未确认即 `fatal_exit`；`halt_tail` 显式检查 | MC63/MC64 |
 | 39 | maintenance 与业务库同库 → halt 期间无法持久化 | 独立 `STATE_DIR/maintenance.json` 原子写 + 回读 | MC64 |
+| 40 | 七态表/内存一致性仍用裸 bool → 实施按旧语义 | 统一 `WriteOutcome`/`PhaseResult`，全文当前有效章节清零 | MC65 |
+| 41 | 部分入口仍读 DB 里的 maintenance → 与文件状态分裂 | §3.3 六通道统一文件契约 + DB 零维护态 | MC66 |
+| 42 | 启动自检被 `-O` 裁剪 → 坏分派表静默通过 | 显式 `if` + 专用异常 + 拒绝启动 | MC67 |
 
 ---
 
-**v1.10 到此结束。** 十三次修订合计**未编写代码、未执行迁移、未修改数据库、未修改生产配置或生产数据**；十三次修订累计只处理"五项 + 两项 + 三项 + S2 异常保护 + 路径与关闭接口一致性 + β′ 跨重启证据 + 证据写入路径 + 证据完整性 + 提交结果确认 + 转换级分派与 phase 落地窗口 + halt 上行传递 + C 类不降级与 halt 故障安全 + 语义统一与 maintenance 持久化一致性"的状态机与伪代码矛盾。**C11–C20 全部未确认，C12 仍未被本轮视为已批准。** 文档交回总体设计最终审查；未获批准前不提交 P-1 实施计划、不进入任何实施阶段。
+**v1.10 到此结束。** 十四次修订合计**未编写代码、未执行迁移、未修改数据库、未修改生产配置或生产数据**；十四次修订累计只处理"五项 + 两项 + 三项 + S2 异常保护 + 路径与关闭接口一致性 + β′ 跨重启证据 + 证据写入路径 + 证据完整性 + 提交结果确认 + 转换级分派与 phase 落地窗口 + halt 上行传递 + C 类不降级与 halt 故障安全 + 语义统一与 maintenance 持久化一致性 + 裸 bool 清理、维护态单一来源与自检去 assert"的状态机与伪代码矛盾。**C11–C20 全部未确认，C12 仍未被本轮视为已批准。** 文档交回总体设计最终审查；未获批准前不提交 P-1 实施计划、不进入任何实施阶段。
