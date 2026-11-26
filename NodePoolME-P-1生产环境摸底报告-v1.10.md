@@ -227,3 +227,56 @@ P-7（批准但目录不存在）→ 未执行（不创建目录），事后 ls 
 2. `logs` 表无 `category` 列（`id, ts, level, source, message`），发布记录只能按 `source`/`message` 文本检索。
 
 **未执行的分支**：P-7 的写入段（本轮按要求不做任何写测试），因此 `ATOMIC_WRITE_SUPPORTED` 结论仍待你在生产批准后取得。
+
+
+---
+
+## 附录 B：探针 r3 安全修正与测试结果
+
+**修正 1：导入副作用改为"先查后导"**
+`backend/config.py:137-138` 导入时对 `DATA_DIR / CONFIG_DIR / LOG_DIR / BACKUP_DIR / SUB_DIR` 做 `mkdir(parents=True, exist_ok=True)`。脚本现在**先**用环境变量推出这 5 个路径并逐个 `exists()`，任一缺失 ⇒ 打印缺失键与完整路径 JSON、`exit 2`，**不导入 config、不创建任何目录**；只有全部存在才进入导入。导入后还把导入值与预检查值逐项比对，不一致（如环境变量与实际配置冲突）同样停止。`STATE_DIR` 不在该 mkdir 清单内，因此不可能被导入"顺手"建出来（`STATE_DIR_AUTOCREATE false`）。
+
+**修正 2：P-7 判定改为六步全过才算成功**
+`steps = {write_tmp_flush_fsync, os_replace, dir_fsync, readback, unlink_testfile, dir_fsync_after_unlink}`，逐步记录；任何一步抛异常 ⇒ `STEP_FAILED <step> <类型> <信息>` + `VERDICT FAILED` + 退出码 3。只有 `len(steps)==6` 且无注入故障才打印 `VERDICT ATOMIC_WRITE_SUPPORTED`。清理只针对本次 `p1probe.<8hex>.tmp/.json` 两个文件名，绝不触碰其他文件；回读要求 `data == {"probe": true}`，内容不符也判失败。
+
+**修正 3：退出码不被 tee 吞掉**
+脚本末尾 `exit "$SCRIPT_RC"`（0=只读探针全完成；2=目标不明已停止；3=P-7 失败）。NAS 侧用 bash 的 `pipefail` 包一层，见附录 C。
+
+**测试矩阵（沙箱：假 docker 壳 + 真实 backend.config + 开发库副本 `/tmp/p1h3`）**
+
+| # | 场景 | 操作 | 结果 |
+| --- | --- | --- | --- |
+| a | 所有目录存在 | 正常跑全流程 | `pre_import_dirs OK`；`exit=0`；`integrity ok`、`table_count 19`、`data_version_changed False` |
+| b | 任一导入目录缺失 | 删 `logs/` 后跑 | `missing: ["LOG_DIR"]` + `exit 2`；**事后 `ls /tmp/p1h3/logs` 仍不存在**（未创建、未导入） |
+| c | 容器不唯一 | 假 `docker ps` 返回 2 个 | 打印候选 + `STOP`，`rc=2`，未继续 |
+| d | 路径映射失败 | 挂载只覆盖 `/backup` | `STOP: 数据库路径映射不到宿主机`，未继续 |
+| e | P-7 未批准 | 目录存在、未设批准 | `SKIPPED`；目录内仅有哨兵文件 `KEEP_ME.txt`，**无任何 p1probe 文件** |
+| f | P-7 任一步失败 | 对判定代码注入 6 类故障（`/tmp` 独立目录） | 6 类全部 `VERDICT FAILED` + `rc=3`；每次事后目录只剩哨兵文件（临时文件被清理，哨兵未被删） |
+| g | 只读探针不改库 | 全流程前后比对 | `sha256` 完全一致（`5082449f…`），`size=167936`、`mtime` 不变 |
+
+`f` 的基线（`fault=none`）在 `/tmp/p7t` 得到 `ATOMIC_WRITE_SUPPORTED`（六步全过）。这是**沙箱演练**，不是生产 P-7；生产 P-7 仍未执行，需你批准且需真实 `STATE_DIR`。
+
+**测试中新增的两条事实**
+
+1. `mode=ro` 打开 WAL 库时，若 `-shm`/`-wal` 不存在，SQLite 会**新建**这两个文件（实测 32 KB `-shm`、0 B `-wal`），主库字节与 mtime 不变。生产容器运行中这两个文件通常已存在，属无变化；但"只读探针完全不产生文件系统变化"这句话不成立，报告口径改为"不改主库内容、不 checkpoint、不写业务表"。
+2. `pipefail` 实测：缺目录场景经 `tee` 仍返回 `2`（未被打平为 0）。
+
+**未执行**：生产 P-7、生产任何写操作、迁移、恢复。
+
+---
+
+## 附录 C：NAS 执行命令（保留日志 + 保留退出码）
+
+```sh
+cd /tmp && curl -fsSLO https://raw.githubusercontent.com/laoXuHome/laoXuHome/main/NodePoolME-P-1-生产探针-v1.10.sh && bash -c 'set -o pipefail; sh /tmp/NodePoolME-P-1-生产探针-v1.10.sh 2>&1 | tee /tmp/p1-probe-$(date +%Y%m%d-%H%M%S).log'; echo "EXIT=$?"
+```
+
+无 bash 时的等价写法（先落盘再打印，退出码不受管道影响）：
+
+```sh
+cd /tmp && curl -fsSLO https://raw.githubusercontent.com/laoXuHome/laoXuHome/main/NodePoolME-P-1-生产探针-v1.10.sh && sh /tmp/NodePoolME-P-1-生产探针-v1.10.sh > /tmp/p1-probe.log 2>&1; rc=$?; cat /tmp/p1-probe.log; echo "EXIT=$rc"
+```
+
+前提：宿主机有 docker、当前用户可 `docker ps`/`docker exec`（root 或 docker 组）；nodepool 容器 running；`DATA_DIR/CONFIG_DIR/LOG_DIR/BACKUP_DIR/SUB_DIR` 五个目录都在（缺失会直接停，不会替你创建）。
+
+预期：`EXIT=0` 且日志含 `pre_import_dirs OK`、`container_*`/`host_*`、`digests_for_repo`、`integrity ok`、`P-7 状态：未执行（等待批准）`；若 `EXIT=2` 看 `STOP:` 那一行为何停止；`EXIT=3` 只会在你批准 P-7 后出现。
