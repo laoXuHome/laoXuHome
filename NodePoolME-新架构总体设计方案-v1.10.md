@@ -15,6 +15,8 @@
 
 **八次修订（Evidence Integrity Closure）**：① `token_fp` 改为 `system_events` 独立列并接入真实 `INSERT` 与 β′ 校验；② `tx_local` 拆到 `migration_tx_notes`，消除与 DDL 的 3 列 INSERT 冲突；③ `write_event` 在 `BEGIN IMMEDIATE` 内做 C1–C8 全链校验后再追加；④ 路径 α/β′ 均在 `set_phase` 前执行 `hist_gate`（`s5_failed_ever` 永久禁止 T7/T8）。改动点见 §0.7。
 
+**十一次修订（Final Halt Propagation Fix）**：`set_phase()` 改为三态返回 `SUCCESS`/`REJECTED`/`HALTED`，`HALTED` 只能经 `halt_tail` 上行（零数据库写入、maintenance 保持）；`emit_event`/`append_reason` 在 `rec.halted` 时拒写。改动点见 §0.10。
+
 **十次修订（Final Design Closure Fix）**：① `emit_event` 的 durability 改由合法转换 `(old,new)` 的 `TRANSITION_DISPATCH` 演算（`migration_phase` 不再按事件名分派），未登记/非法转换零写入；② `set_phase` 在事件确认后的 `rec.phase` 落地窗口加异常保护，异常即 `halt_migration`（不重发、不换转换、不判事件失败）。改动点见 §0.9。
 
 **九次修订（Commit Outcome Reconciliation）**：`write_event` 在 `COMMIT`/`ROLLBACK`/`close` 抛错后**真实执行**只读重查（8 字段逐项比对 + 重跑 C1–C8），按 A（已提交→采纳）/ B（确认未提交→失败）/ C（无法确认→停 maintenance）裁决；`emit_event()` 成为 `set_phase` 与 `append_reason` 的唯一事件入口，两个后端的连接/事务/失败/链语义不变。改动点见 §0.8。
@@ -103,6 +105,14 @@
 | P0-2 phase 落地异常 | §2.1 `commit_phase_in_memory` + `set_phase` 两支调用 + `halt_migration` 约束；§2.2 新增两行；§2.3 新增三行 | 事件确认后 `rec.phase` 赋值抛错 ⇒ halt（不重发、不换转换、不判事件失败）；已提交事件保留为唯一事实 |
 | 测试 | §2.5 MC57–MC59、§7 计数 56→59 | 真实 SQLite 行 + 调用计数 + 日志码互斥断言 |
 
+### 0.10 十一次修订改动点（Final Halt Propagation Fix）
+
+| 项 | 位置 | 改动 |
+| --- | --- | --- |
+| P0 halt 上行传递 | §2.1 `PhaseResult` 三态 + `halt_migration` 幂等 + `commit_phase_in_memory` 返回三态 + `set_phase` 三态返回；§2.2 重写上层分派 + `halt_tail` + 三态分派表 | 裸 `bool` 退出，`HALTED` 不可被降级为普通失败；`halt_tail` 零数据库写入 |
+| 第二道防线 | §2.1 / §1.2：`emit_event`、`append_reason`、`set_phase` 在 `rec.halted` 时 `raise MigrationHalted` | 即使上层误写，也不会产生任何 DB 事件 |
+| 测试 | §2.5 MC60 + MC60b 对照、§7 计数 59→60 | 断言 `halt_migration` 一次、`INSERT` == 1、`count(*)` 不变、无 note、无第二 phase、无 success、503 |
+
 ### 0.3 四次修订改动点（S2 异常保护）
 
 | 项 | 位置 | 改动 |
@@ -161,6 +171,8 @@
 # 伪代码：migration_note 走同一 durable 入口（全链校验在 write_event 事务内完成）
 def append_reason(rec, code, detail):
     """在 phase 不变的前提下追加上下文；不允许伪装成状态转换。"""
+    if rec.halted:                                        # halt 之后零数据库写入（第二道防线）
+        raise MigrationHalted("append_reason")
     payload = dict(phase=rec.phase.name, code=code, detail=detail)
     return emit_event(rec, "migration_note", payload)     # → write_event；链损坏 → 内部拒绝，只写文件日志
 ```
@@ -174,6 +186,8 @@ def append_reason(rec, code, detail):
 | 分派键 = 合法转换 | 后端由 `TRANSITION_DISPATCH[(old,new)]`（§2.1）唯一决定；`migration_phase` 不按事件名分派；`(old,new)` 不在表中即 `IllegalDurability`，不回退默认后端 |
 | 调用方不得自带 `durability` | `detail` 内出现 `durability` 字段 → `IllegalDurability`；`old` 必须等于 `rec.phase`（否则 `PhaseMismatch`） |
 | 事件确认后 phase 落地受保护 | 由 `commit_phase_in_memory()` 完成；抛错即 `halt_migration`，不得重发事件、不得换转换、不得判为事件写入失败 |
+| 三态结果必须上行 | `set_phase` 返回 `SUCCESS`/`REJECTED`/`HALTED`；调用点必须按三态分派，`HALTED` 只能经 `halt_tail` 处理（零数据库写入） |
+| halt 后拒写 | `rec.halted == True` 时 `emit_event` / `append_reason` / `set_phase` 一律 `raise MigrationHalted`，不产生任何 DB 事件 |
 | `migration_id` / `token_fp` / `seq` / `prev_sha` / `s5_failed_ever` 必带（durable） | 由 `write_event` 在事务内生成并写入独立列；调用方不得传入 |
 | `s5_failed_ever` 单调 | 写前校验 + 事务回滚；倒退即 `EvidenceMonotonicityViolation` |
 | 全链校验前置 | `verify_full_chain`（C1–C8）在同一 `BEGIN IMMEDIATE` 内执行，通过后才分配 `seq`/`prev_sha` |
@@ -275,7 +289,7 @@ def append_reason(rec, code, detail):
 
 任何情况下都**不得**为写入 note 而补建、重算、覆盖或删除历史事件；链一旦断，只能人工介入。
 
-**T6 事件写不进去时**：仍按 §2.1/§2.4 的既有规则处理——`set_phase` 返回 `False`，内存仍 `COMMIT_ATTEMPTED`，**不得**伪造 `UNKNOWN`、不得开放写入；随后可按 T6′ 的口径停 `COMMIT_ATTEMPTED` + 文件日志 + 保守恢复。
+**T6 事件写不进去时**：仍按 §2.1/§2.4 的既有规则处理——`set_phase` 返回 `REJECTED`，内存仍 `COMMIT_ATTEMPTED`，**不得**伪造 `UNKNOWN`、不得开放写入；随后可按 T6′ 的口径停 `COMMIT_ATTEMPTED` + 文件日志 + 保守恢复。
 
 **禁止项（写进设计约束，供实施阶段校验）**
 
@@ -368,7 +382,7 @@ CREATE TABLE migration_tx_notes (
 
 1. **唯一可信来源**：迁移凭据行。`rec.token_fp = token_fp_from_credential(token_row)`，在 T2 之后、S1 之前计算一次，此后只读；
 2. **写入路径**：`set_phase` → `emit_event(event, detail)` → durable 后端 `write_event()` 从 `rec.token_fp` 取值，**作为独立列** `token_fp` 与 `detail_json` 同一条 `INSERT` 落库（`detail_json` 内**不重复**该字段，全篇唯一口径 = 独立列）；
-3. **写入前校验**：格式（64 位小写 hex）+ 与 `rec.token_fp` 相等 + 与凭据行当前值相等；任一不符 → `required_evidence_missing()` 返回 `"token_fp"`，T6 拒写，`set_phase` 返回 `False`；
+3. **写入前校验**：格式（64 位小写 hex）+ 与 `rec.token_fp` 相等 + 与凭据行当前值相等；任一不符 → `required_evidence_missing()` 返回 `"token_fp"`，T6 拒写，`set_phase` 返回 `REJECTED`；
 4. **β′ 读取路径**：`SELECT token_fp FROM system_events WHERE migration_id=?` 取 T6 行（`E1` 定位的那一条）的**真实列值**，与当前凭据行重算值比对；缺失 / 非 64 hex / 不一致 → E2 失败 → 禁 T7/T8；
 5. **不得降级**：`token_fp` 为空字符串、`NULL`、`"unknown"` 之类占位值一律视为缺失（DDL 的 `NOT NULL CHECK(length=64)` 与写入前校验双保险）。
 
@@ -570,6 +584,8 @@ def _assert_dispatch_invariants():
 
 def emit_event(rec, event, detail):
     """唯一入口。后端由合法转换表现算得出，调用方不得传入 durability。detail 原样透传。"""
+    if rec.halted:                                      # halt 之后零数据库写入（第二道防线）
+        raise MigrationHalted(event)
     if "durability" in detail:                          # 调用方不得自带分派依据
         raise IllegalDurability(event, detail["durability"])
 
@@ -610,48 +626,83 @@ def write_tx_event(rec, event, detail):
         non_db_log("tx_local_note_failed", e)          # 非权威，失败仅日志
     return True                                        # phase 仍推进（见语义对照）
 
+class PhaseResult(Enum):
+    SUCCESS  = "success"    # 事件成功 ∧ 内存 phase 更新成功
+    REJECTED = "rejected"   # 事件未提交 / 证据不合格：正常失败，可走原失败路径
+    HALTED   = "halted"     # 事件已确认提交，但内存落地异常：已进 maintenance，禁止任何后续数据库写入
+
+def halt_migration(rec, code, detail):
+    """幂等；不抛异常；只置位 maintenance/封锁 + 非数据库日志。"""
+    if rec.halted:                                  # 只允许一次
+        return
+    rec.halted = True
+    try:
+        set_maintenance(rec); block_business_writes(rec)
+        non_db_log(code, detail)
+    finally:
+        rec.exit_code = NONZERO                     # 不抛出，交由上层按 PhaseResult 处理
+
 def commit_phase_in_memory(rec, new):
-    """事件确认后的唯一 phase 落地动作；此窗口内的任何异常都必须 halt，而不是判"事件失败"。"""
+    """事件确认后的唯一 phase 落地动作。返回 PhaseResult，不再返回裸 bool。"""
     try:
         rec.phase = new
         rec.phase_epoch += 1
-        return True
-    except Exception as e:                             # 内存态落地失败 = 状态机已不可信
+        return PhaseResult.SUCCESS
+    except Exception as e:
         non_db_log("phase_commit_window_failed",
                    dict(new=new.name, committed_event=True, err=e))
-        halt_migration("phase_update_after_committed_event", new.name)  # 不重发、不换转换
-        return False
+        halt_migration(rec, "phase_update_after_committed_event", new.name)
+        return PhaseResult.HALTED                   # ← 必须原样上行，不得降级
 
-def set_phase(rec, new, reason):
-    """唯一状态转换入口；两种后端都只经 emit_event，不得直连 write_event / write_tx_event。"""
+def set_phase(rec, new, reason) -> PhaseResult:
+    """唯一状态转换入口。返回三态之一；HALTED 必须由上层原样处理。"""
+    if rec.halted:                                  # 已 halt：拒绝任何新转换
+        raise MigrationHalted("set_phase")
     old = rec.phase
     if (old, new) not in LEGAL_TRANSITIONS:
         raise IllegalTransition(old, new)
-    mode = TRANSITION_DISPATCH[(old, new)]              # 与 emit_event 同源
+    mode = TRANSITION_DISPATCH[(old, new)]           # 与 emit_event 同源
 
-    detail = dict(old_phase=old.name, new_phase=new.name, reason=reason)  # 不带 durability
+    detail = dict(old_phase=old.name, new_phase=new.name, reason=reason)
 
-    if mode == "tx_local":                              # T1/T2：随迁移事务，非权威
-        emit_event(rec, "migration_phase", detail)      # → write_tx_event（失败仅日志）
-        if not commit_phase_in_memory(rec, new):        # 同一窗口保护，语义一致
-            return False
-        return True
+    if mode == "tx_local":                           # T1/T2：随迁移事务，非权威
+        emit_event(rec, "migration_phase", detail)   # → write_tx_event（失败仅日志）
+        return commit_phase_in_memory(rec, new)      # 落地异常 → HALTED
 
-    if (old, new) == (Phase.COMMIT_ATTEMPTED, Phase.UNKNOWN):        # T6：证据必须齐
-        detail["k1_proof"] = k1_proof_from_state(rec.k1_state)       # 只读判定结果
-        detail["s5_result"] = rec.s5_result                          # 本次实际结果
-        missing = required_evidence_missing(rec, detail)             # §1.4 字段 + token_fp 格式/一致性
+    if (old, new) == (Phase.COMMIT_ATTEMPTED, Phase.UNKNOWN):        # T6 证据闸
+        detail["k1_proof"] = k1_proof_from_state(rec.k1_state)
+        detail["s5_result"] = rec.s5_result
+        missing = required_evidence_missing(rec, detail)
         if missing or not all_true(detail["k1_proof"]):
-            non_db_log("t6_evidence_incomplete", missing); return False
+            non_db_log("t6_evidence_incomplete", missing)
+            return PhaseResult.REJECTED              # 证据不合格：未写事件，正常失败
 
-    ok = emit_event(rec, "migration_phase", detail)     # → write_event（内含提交结果确认）
-    if not ok:
-        return False                                    # B/C 路径：状态不推进，事件未提交
-    # ↓ 此处事件已在库中确定（正常 COMMIT 或 A 路径采纳）；以下窗口禁止任何"事件失败"解读
-    if not commit_phase_in_memory(rec, new):
-        return False                                    # halt 已在内部完成
-    return True
+    if not emit_event(rec, "migration_phase", detail):   # write_event 的 A/B/C 裁决
+        return PhaseResult.REJECTED                      # B/C：事件未提交，正常失败
+    # ↓ 事件已在库中确定：窗口内异常只能 HALTED，不得解读为事件失败
+    return commit_phase_in_memory(rec, new)
 ```
+
+**三态结果的语义与上行规则**
+
+| 结果 | 产生条件 | 内存 phase | 库内事件 | 上层必须做 | 上层禁止 |
+| --- | --- | --- | --- | --- | --- |
+| `SUCCESS` | 事件成功（正常 COMMIT 或 A 采纳）∧ `rec.phase` 落地成功 | 已改 | 已存在且唯一 | 按原成功路径继续（进阶段 C 等） | — |
+| `REJECTED` | 证据不合格（T6 闸），或 `write_event` 返回 B/C（事件未提交） | 未改 | **不存在**（C 情况下也无法确认，但一律不再写） | 走原失败路径（`append_reason` / `handle_post_commit_failure`） | 不得当 HALTED 处理 |
+| `HALTED` | 事件已确认提交，但 `rec.phase` 落地抛错 | 未改（且不可信） | **已存在且唯一** | `halt_tail(rec)`：保持 maintenance + 封锁、只写非数据库日志、返回 | **不得** `append_reason` / `emit_event` / 任一底层写入 / 第二次转换 / 进阶段 C |
+
+**上层调用链的强制写法（`False` 不再作为唯一信号）**
+
+```python
+def halt_tail(rec):
+    """HALTED 唯一允许的收尾：零数据库写入。"""
+    rec.halted = True
+    assert rec.maintenance and rec.writes_blocked
+    non_db_log("halt_tail_no_db_write", dict(phase=rec.phase.name))
+    return PhaseResult.HALTED          # 继续上行，直到最外层停止迁移
+```
+
+`emit_event()` 与 `append_reason()` 在入口增加第二道防线：`if rec.halted: raise MigrationHalted(event)` —— 即使上层误写，也只会得到异常，**不会产生任何数据库事件**。
 
 **转换 → 后端分派表（唯一口径，`DURABILITY` 列即 `TRANSITION_DISPATCH` 的值）**
 
@@ -679,7 +730,7 @@ def set_phase(rec, new, reason):
 
 **`required_evidence_missing(rec, detail)`（T6 专用，返回缺失/不合格项名或 `None`）**
 
-依次检查：`migration_id`、`old_phase=COMMIT_ATTEMPTED`、`new_phase=UNKNOWN`、`k1_proof` 四布尔全 true 且含 `evidence_ts`、`s5_result ∈ {ok, failed}`（`not_run` 视为缺失）、`token_fp` 存在且 `^[0-9a-f]{64}$` 且等于 `credential_token_fp(MID)`、`rec.s5_failed_ever` 与 `rec.s5_result` 一致（`failed ⇒ True`）。任一不过 → T6 不写、`set_phase` 返回 `False`（MC43）。
+依次检查：`migration_id`、`old_phase=COMMIT_ATTEMPTED`、`new_phase=UNKNOWN`、`k1_proof` 四布尔全 true 且含 `evidence_ts`、`s5_result ∈ {ok, failed}`（`not_run` 视为缺失）、`token_fp` 存在且 `^[0-9a-f]{64}$` 且等于 `credential_token_fp(MID)`、`rec.s5_failed_ever` 与 `rec.s5_result` 一致（`failed ⇒ True`）。任一不过 → T6 不写、`set_phase` 返回 `REJECTED`（MC43）。
 
 **写入结果不确定时的处理**：已完整实现在 `write_event` / `settle_uncertain` / `reconcile_event` 伪代码中（见上），不再以"规则表"形式存在——规则表与伪代码不一致正是本轮 P0。
 
@@ -701,7 +752,7 @@ def set_phase(rec, new, reason):
 2. 终止证据成立：路径 α 用 `K1`（§3.1）；路径 β 用 `K1_β`（§1.2 路径表）；路径 β′ 用 **T6 事件内的 `k1_proof`**（§1.4，历史证明，不由当前 phase 推断）；
 3. `K2` 成立（§3.2，即 S5 成功）；
 4. **历史 S5 失败门禁**：`rec.s5_failed_ever == False`（路径 α 用本进程值，β′ 用事件列恢复值）——为 `True` 时**永久禁止 T7**（T7′），后续 `probe_ok` 不得清除；
-5. 对应的 `durable` 状态转换事件写入成功——路径 α 是 `T7`（`UNKNOWN → COMMITTED`），路径 β 是 `T4`（`COMMIT_ATTEMPTED → COMMITTED`），`set_phase` 返回 `True` 且 `rec.phase == COMMITTED`。
+5. 对应的 `durable` 状态转换事件写入成功——路径 α 是 `T7`（`UNKNOWN → COMMITTED`），路径 β 是 `T4`（`COMMIT_ATTEMPTED → COMMITTED`），`set_phase` 返回 `SUCCESS` 且 `rec.phase == COMMITTED`。
 
 **门禁必须在 `set_phase()` 之前执行**：历史失败是**业务状态禁止**，`write_event` 的单调性检查是**写入完整性约束**。前者不能靠后者的"拒写"实现（否则会出现"事件写不进去所以状态没变"的偶然正确），两者必须分别判定、分别测试（MC44/MC45/MC47）。
 
@@ -711,48 +762,81 @@ def set_phase(rec, new, reason):
 
 | `emit_event` 结果 | 含义 | `set_phase` 返回 | `rec.phase` | 调用方后续 |
 | --- | --- | --- | --- | --- |
-| 正常 `COMMIT` 返回 | 事件确定已提交 | `True` | 改为新值 | 按成功路径继续（α 进阶段 C；β 进阶段 C） |
-| A（`COMMIT` 抛错，重查确认存在且全字段一致、全链通过） | 事件**实际已提交**，只是调用方没收到返回值 | `True` | 改为新值 | **按成功路径继续**；不得再判"事件失败"分支 |
-| B（重查确认目标行不存在） | 事件确实未提交 | `False` | 保持旧值 | 走本文各失败分支（`append_reason` / 保守恢复） |
-| C（不可读 / 字段不一致 / 链断裂 / 自相矛盾） | 结果无法确认 | `False` | 保持旧值 | `halt_migration`：maintenance 保持、只写 `migration-fault.log`、不重试、不开放写入、等人工 |
-| T6 证据缺失（未发出 `INSERT`） | 证据不合格 | `False`（不写事件） | 保持 `COMMIT_ATTEMPTED` | 按 T6′ 同口径（停 `COMMIT_ATTEMPTED`、文件日志） |
-| **事件已确认，`rec.phase` 落地抛错** | 事件已成为事实，内存态不可信 | `False` | 保持旧值（但库内事件为真） | **`halt_migration`**：maintenance、`migration-fault.log`（`phase_commit_window_failed`）；**不重发、不换转换、不按"事件失败"处理**；只走人工恢复 |
+| 正常 `COMMIT` 返回 | 事件确定已提交 | `SUCCESS` | 改为新值 | 按成功路径继续（α 进阶段 C；β 进阶段 C） |
+| A（`COMMIT` 抛错，重查确认存在且全字段一致、全链通过） | 事件**实际已提交**，只是调用方没收到返回值 | `SUCCESS` | 改为新值 | **按成功路径继续**；不得再判"事件失败"分支 |
+| B（重查确认目标行不存在） | 事件确实未提交 | `REJECTED` | 保持旧值 | 走本文各失败分支（`append_reason` / 保守恢复） |
+| C（不可读 / 字段不一致 / 链断裂 / 自相矛盾） | 结果无法确认 | `REJECTED`（内部已 `halt_migration`） | 保持旧值 | 已 halt：**不得**再 `append_reason`；上层遇到 `rec.halted` 一律走 `halt_tail`（零数据库写入） |
+| T6 证据缺失（未发出 `INSERT`） | 证据不合格 | `REJECTED`（不写事件） | 保持 `COMMIT_ATTEMPTED` | 按 T6′ 同口径（停 `COMMIT_ATTEMPTED`、文件日志） |
+| **事件已确认，`rec.phase` 落地抛错** | 事件已成为事实，内存态不可信 | **`HALTED`** | 保持旧值（但库内事件为真） | **`halt_tail`**：不 `append_reason`、不重发、不换转换、不进阶段 C；maintenance + 文件日志；只走人工恢复 |
 | 分派非法（未登记事件 / 转换不在 `TRANSITION_DISPATCH` / `old != rec.phase` / 调用方自带 `durability`） | 入口闸门拒写 | 抛 `IllegalDurability` / `IllegalTransition` / `PhaseMismatch` | 保持旧值、无事件写入 | 由调用方按自身错误路径处理；不得重试换后端 |
 
 > 对 `T4/T5/T7/T8` 而言，"事件失败"分支**只对应 B 与 T6 式证据缺失**；A 不得被当作失败处理（否则会造成"库里已有事件、内存却按未提交继续"的分裂）；C 不得被降级为 B。
+>
+> **C 与 `HALTED` 的区别**：C 属于"事件结果无法确认"，`set_phase` 返回 `REJECTED` 但 `halt_migration` 已置位 `rec.halted`；上层必须先看 `rec.halted`（或 `halt_tail` 内的断言）再决定能否写 note——`halted=True` 时一律零数据库写入。`HALTED` 则专指"事件确定已提交、仅内存落地失败"。
 
 **`evidence_ok` 的定义**（仅 β′ 需要）：E1 ∧ E2 ∧ E3 全通过 ∧ `s5_failed == False`；为 `False` 时不得进入 T7/T8 判定。
 
 ```python
-# 伪代码
+# 伪代码：上层分支按 PhaseResult 三态分派，禁止把 HALTED 当普通失败
+def after_transition(rec, res):
+    """所有 set_phase 调用点的统一后置处理。"""
+    if res is PhaseResult.SUCCESS:
+        enter_phase_c(rec)
+        return res
+    if res is PhaseResult.HALTED:          # 事件已提交、内存不可信
+        return halt_tail(rec)              # 零数据库写入
+    # REJECTED：原失败路径
+    return res
+
 token_gate = token_visible and k1_or_beta and k2          # ①–③
 hist_gate  = not rec.s5_failed_ever                        # ④ 历史失败门禁（α / β′ 共用）
 gate       = token_gate and hist_gate
 
 if rec.phase == Phase.COMMIT_ATTEMPTED:        # 只可能是路径 β
-    if not (gate and set_phase(rec, Phase.COMMITTED, "recovery_gate_passed")):
+    if not gate:
         # T4′：不转换，不退化为 UNKNOWN（路径 β 没有 →UNKNOWN 这一步）
         append_reason(rec, "recovery_gate_failed", ...) if k1_beta else non_db_log(...)
-        handle_post_commit_failure(...)
+        handle_post_commit_failure(rec)
     else:
-        enter_phase_c(rec)
+        res = set_phase(rec, Phase.COMMITTED, "recovery_gate_passed")
+        if res is PhaseResult.HALTED:
+            halt_tail(rec)                     # 不 append_reason、不重试、不进 C
+        elif res is PhaseResult.REJECTED:      # T4′
+            append_reason(rec, "recovery_gate_failed", ...) if k1_beta else non_db_log(...)
+            handle_post_commit_failure(rec)
+        else:                                  # SUCCESS
+            enter_phase_c(rec)
 
 elif rec.phase == Phase.UNKNOWN:               # 路径 α 或 β′
     if is_beta_prime and not evidence_ok:      # E1–E3 未通过：不得判 T7/T8
         append_reason(rec, "evidence_unverified", ...)
-        handle_post_commit_failure(...)
+        handle_post_commit_failure(rec)
     elif not hist_gate:                        # ④ 历史曾失败 → T7′（永久）
         append_reason(rec, "historical_s5_failure", ...)   # 只记原因，不转换
-        handle_post_commit_failure(...)
+        handle_post_commit_failure(rec)
     elif not token_gate:                       # ①–③ 不全 → 停留 UNKNOWN
         append_reason(rec, "unknown_gate_incomplete", ...)
-        handle_post_commit_failure(...)
-    elif not set_phase(rec, Phase.COMMITTED, "token_visible_and_isolated"):
-        append_reason(rec, "committed_event_failed", ...)     # 仍停留 UNKNOWN
-        handle_post_commit_failure(...)
+        handle_post_commit_failure(rec)
     else:
-        enter_phase_c(rec)                     # 唯一的阶段 C 入口
+        res = set_phase(rec, Phase.COMMITTED, "token_visible_and_isolated")
+        if res is PhaseResult.HALTED:
+            halt_tail(rec)                     # 零数据库写入，maintenance 保持
+        elif res is PhaseResult.REJECTED:
+            append_reason(rec, "committed_event_failed", ...)   # 仍停留 UNKNOWN
+            handle_post_commit_failure(rec)
+        else:                                  # SUCCESS
+            enter_phase_c(rec)                 # 唯一的阶段 C 入口
 ```
+
+**三态在上层的分派表（每个 `set_phase` 调用点都必须按此分派）**
+
+| `set_phase` 返回 | β（`COMMIT_ATTEMPTED`）分支 | α / β′（`UNKNOWN`）分支 | 是否可写 `migration_note` |
+| --- | --- | --- | --- |
+| `SUCCESS` | `enter_phase_c` | `enter_phase_c` | 允许（正常路径，非本转换原因） |
+| `REJECTED` | `append_reason("recovery_gate_failed")`（仅 `K1_β` 真）+ `handle_post_commit_failure` | `append_reason("committed_event_failed")` + `handle_post_commit_failure` | 允许（事件未提交，链未受影响） |
+| `HALTED` | `halt_tail`：不写 note、不换转换、不进 C | `halt_tail`：同左 | **禁止** |
+
+**为什么 `HALTED` 不能靠 `False` 表达**：`REJECTED` 时库内没有新事件，追加一条 `migration_note` 是合法的收尾；`HALTED` 时库内**已有**本次转换事件且内存态不可信，任何后续写入都会在同一 `migration_id` 上继续追加、掩盖"事件已提交"的事实，甚至与人工恢复冲突。两者必须用不同结果类型区分，且 `HALTED` 只能原样上行。
 
 **T8（`UNKNOWN → TX_ROLLED_BACK`）同样受 ④ 约束**：`hist_gate` 为 `False` 时一律走 T8′，即使 token 与迁移对象均不可见；判定顺序同样是"历史门禁 → 结论条件 → `set_phase`"。
 
@@ -766,11 +850,13 @@ elif rec.phase == Phase.UNKNOWN:               # 路径 α 或 β′
 | `UNKNOWN → TX_ROLLED_BACK` 但 **S5 曾失败** | **不允许**（T8′） | 同源理由：看不到 token 也不能证明外部写者已消失 | 保持 `UNKNOWN`，继续保守恢复 |
 | β′ 的 T7/T8 但 **E1–E3 未通过** | **不允许** | 缺历史 K1 证明或 `s5_failed` 不可恢复时，任何结论都无依据 | 停 `UNKNOWN`；链完整时一条 `evidence_unverified`，链断裂时只写文件日志；不进阶段 C |
 | T6 证据构造失败后的"补写" | **不允许** | 不得只补部分字段、不得跳过校验、不得用 `migration_note` 冒充 T6 | 返回 `False`，停 `COMMIT_ATTEMPTED`，文件日志 |
-| `token_fp` 缺失 / 非 64 位 hex / 与凭据行不符 | **不允许**（DB 的 `CHECK(length=64)` + 写入前校验双保险） | 指纹是"迁移身份"的一部分，无法降级 | T6 拒写（`set_phase` 返回 `False`）；β′ E2 失败 |
+| `token_fp` 缺失 / 非 64 位 hex / 与凭据行不符 | **不允许**（DB 的 `CHECK(length=64)` + 写入前校验双保险） | 指纹是"迁移身份"的一部分，无法降级 | T6 拒写（`set_phase` 返回 `REJECTED`）；β′ E2 失败 |
 | 事件链 C1–C8 任一失败 | **不允许**追加 | 断链不可自动修复 | 不写事件、不推进 phase、maintenance、只写文件日志 |
 | 写入结果不确定（`COMMIT`/`ROLLBACK`/`close` 抛错） | **不允许重发**同一逻辑事件 | 重发会造成重复 `seq` / 分叉链 | 独立只读连接重查：A（一致且链通过）采纳并按成功推进；B（确认不存在）返回失败、不推进；C（不可读/不一致/链断裂）停 maintenance、只写文件日志 |
 | 重查发现目标行存在但字段不一致 / 目标行之后仍有事件 | **不允许采纳** | 只凭 `seq` 存在就采纳会引入别人写的或损坏的行 | 判 C：不推进 phase、不开放写入、`migration-fault.log`、等人工 |
 | 只读重查不可用（`SQLITE_BUSY`/文件不可读/连接失败） | **不允许解释为"事件不存在"** | 把查询失败当未提交会造成"库里已有事件、再走另一条转换" | 判 C：maintenance 保持、不重发、不开放写入 |
+| `HALTED` 被上层转成"事件失败"继续写 note | **不允许** | `HALTED` 意味着库内已有本次事件，追加 note 会掩盖事实并与人工恢复冲突 | 三态结果 + `halt_tail` 零写入 + `emit_event`/`append_reason` 的 `rec.halted` 拒写闸 |
+| `REJECTED` 被误当 `HALTED` 触发停机 | **不允许** | 事件确未提交时停机是过度保守，会阻断可恢复路径 | 三态类型区分；MC60 对照用例覆盖 B 类 |
 | 事件已提交后 `rec.phase` 落地抛错 | **不允许**当作事件失败，也不允许重发 | 库里事件是真事实，重发会造重复 `seq`；判"事件失败"会引第二条转换路径 | `halt_migration` + maintenance + 文件日志；保留已提交事件；仅人工恢复 |
 | 未登记事件 / 非法转换分派 | **不允许**回退到默认后端 | 默认分派会把 T1/T2 写进证据链或把 T6 写进事务内提示 | 抛 `IllegalDurability` / `IllegalTransition`，拒写 |
 | 调用方自带 `durability` 字段 | **不允许** | 分派依据必须由合法转换表演算 | `emit_event` 立即 `IllegalDurability` |
@@ -791,11 +877,11 @@ elif rec.phase == Phase.UNKNOWN:               # 路径 α 或 β′
 
 三者必须一致：`COMMITTED` 出现在内存与事件中 ⇒ `enter_phase_c` 被调用一次；事件里没有 `COMMITTED` ⇒ 内存不得为 `COMMITTED` ⇒ 未进入阶段 C ⇒ 无 success、写入仍关闭。
 
-### 2.5 测试（PH9–PH11、PH9b、PH10b + MC19–MC21 + MC38–MC59）
+### 2.5 测试（PH9–PH11、PH9b、PH10b + MC19–MC21 + MC38–MC60）
 
 | # | 初始 | 步骤 | 预期 |
 | --- | --- | --- | --- |
-| PH9 | **路径 α**：已 `UNKNOWN`，token 可见、K1/K2 成立，`T7 →COMMITTED` 事件写失败 | 注入写失败 | `set_phase` 返回 False；内存仍 `UNKNOWN`；**不退化、不逆转**（也不得改走 T4）；未进入阶段 C；无 success；写入关闭 |
+| PH9 | **路径 α**：已 `UNKNOWN`，token 可见、K1/K2 成立，`T7 →COMMITTED` 事件写失败（B 类） | 注入写失败 | `set_phase` 返回 `REJECTED`；内存仍 `UNKNOWN`；**不退化、不逆转**（也不得改走 T4）；未进入阶段 C；无 success；写入关闭 |
 | PH9b | **路径 β**：`COMMIT_ATTEMPTED`，token 可见、`K1_β`/K2 成立，`T4 →COMMITTED` 事件写失败 | 注入写失败 | 内存仍 `COMMIT_ATTEMPTED`（T4′）；`migration_note` 一条；**无 `→UNKNOWN` 事件**；未进入阶段 C；无 success |
 | PH10 | **路径 α**：T6（`→UNKNOWN`）事件与 T7（`→COMMITTED`）事件均失败 | 注入两次失败 | 无任何 `migration_phase` 事件；内存停留 **`COMMIT_ATTEMPTED`**（T6 事件失败 → §2.1 不推进）；maintenance 保持；非数据库日志两条；保守恢复；退出码非零 |
 | PH10b | **路径 β**：T4 事件失败且 `migration_note` 也失败 | 注入两次失败 | 无 `migration_phase` 事件；内存停 `COMMIT_ATTEMPTED`；maintenance 保持；文件日志两条；无 success |
@@ -824,6 +910,8 @@ elif rec.phase == Phase.UNKNOWN:               # 路径 α 或 β′
 | MC57 | 逐条触发 T1、T2、T3、T4、T5、T6、T7、T8 与 `migration_note`；另构造非法输入：未登记事件名、`(old,new)` 不在 `LEGAL_TRANSITIONS`、`old != rec.phase`、`detail` 自带 `durability`、`(old,new)` 不在 `TRANSITION_DISPATCH` | 打桩记录 `emit_event` 入口、`TRANSITION_DISPATCH` 命中键与后端函数调用 | T1/T2 → `write_tx_event`，行落 `migration_tx_notes`（`system_events` 无对应行）；T3–T8 与 note → `write_event`，行落 `system_events` 且链通过 C1–C8；五种非法输入全部抛异常且 **零写入**；两个后端函数的直接调用点仅存在于 `emit_event` 内部（静态断言 + 调用计数） |
 | MC58 | 事件已真实提交（`set_phase` 走到 `commit_phase_in_memory`），在该窗口注入 `rec.phase = new` 抛错 | 注入异常，随后重启进程读取 DB 与 maintenance 标记 | `halt_migration` 被调用一次；maintenance 保持；`migration-fault.log` 有 `phase_commit_window_failed`；`system_events` 中该事件**仍存在且唯一**（写入前后 `count(*)` 不变、无第二次 `INSERT`）；无第二次状态转换（事件序列里无额外 `migration_phase`）；未进入阶段 C、无 success、写入 503 |
 | MC59 | 同 MC58，但分别用 `rollback_for_migration` 抛错、`close` 抛错、`emit_event` 返回 `False` 三种对照 | 对照观察错误归类 | phase 落地异常 ⇒ 归 `phase_update_after_committed_event`（halt），**不归** `event_write_failed`；事件不重发（`INSERT` 计数 == 1）；`emit_event` 返回 `False` ⇒ 归 B/C 正常失败路径、不 halt；两类日志码不互相出现 |
+| MC60 | 事件真实提交成功后注入 `rec.phase` 落地异常，完整执行 §2.2 上层调用流程（β 与 α 各一次） | 读 DB + 打桩记录 `halt_migration` / `INSERT` / `append_reason` / `enter_phase_c` 计数 | `halt_migration` 调用**一次**（重复调用为 no-op）；上层收到 **`HALTED`**（不是 `False`/`REJECTED`），且 `halt_tail` 未产生任何 DB 写；`system_events` 写入前后 `count(*)` **完全一致**；原事件存在且唯一；无新 `migration_note`、无第二条 `migration_phase`；`INSERT` 调用次数 == **1**；未进阶段 C；`schema_migrations` 无 success；maintenance 保持、业务写入 503；halt 之后无任何数据库写入（用连接级写计数断言） |
+| MC60b（对照） | 普通 B 类：`COMMIT` 未成功、重查确认目标行不存在 | 同上层流程 | 返回 `REJECTED`；**不触发** `halt_migration`（调用计数 0）；按原失败路径写一条 `migration_note`；`rec.halted == False`；maintenance 未被置位（按原设计走保守恢复） |
 
 
 ---
@@ -1110,9 +1198,11 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 >
 > **路径不混用**：α 只出 `T6/T6′` 与 `T7/T7′/T8/T8′`；β 只出 `T4/T4′/T5`。表中「路径」列的 `α / β′` 表示两者共用同一转换定义（此时 phase 已是 `UNKNOWN`，终止证据按各自入口解释）。
 >
-| — | （phase 已按事件推进但内存落地失败） | 事件确认成功、`rec.phase` 赋值抛错 | 共用 | durable / tx_local 已写入 | 事件确认后 | **不是转换**：`halt_migration` + maintenance + 文件日志；事件保留为事实；不重发、不换转换 |
+| — | （phase 已按事件推进但内存落地失败） | 事件确认成功、`rec.phase` 赋值抛错 | 共用 | durable / tx_local 已写入 | 事件确认后 | **不是转换**：`set_phase` 返回 `HALTED` → `halt_tail`；maintenance + 文件日志；事件保留为事实；不重发、不换转换、不写 note |
 | — | （无转换，入口拒写） | 分派非法（未登记事件 / 非法转换 / `old != rec.phase` / 自带 `durability`） | 共用 | **无** | — | 抛错拒写；零事件、phase 不变 |
 
+> **`set_phase` 为三态返回**：`SUCCESS` = 事件成功且内存已改；`REJECTED` = 事件未提交/证据不合格（走原失败路径，可写 note）；`HALTED` = 事件已提交但内存落地失败（零数据库写入、停 maintenance）。任何上层不得用布尔判断代替三态；`C` 类不可确认虽有 `halted` 置位，也按 `halt_tail` 处理。
+>
 > **"事件失败"仅指 B（确认未提交）与 T6 式证据缺失**：A（重查确认已提交）按成功路径推进；C（无法确认）不推进且停 maintenance——三者不得混同，也不得用异常类型代替重查。
 >
 > **S2 异常不产生任何转换**：属性读、隔离、回滚三段中的任一抛错，都只写 `migration-fault.log`；`phase` 仍为 `COMMIT_ATTEMPTED`。若隔离确认且关闭成功 → 走 T6 写 `→UNKNOWN`；否则走 T6′（无转换）。
@@ -1152,7 +1242,7 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | 要求 | 落实 |
 | --- | --- |
 | 两类确认语义 | §2.1 表：durable 失败不改内存；tx_local 改了但非权威 |
-| 事件失败不得对外使用新状态 | `set_phase` 返回 False，`rec.phase` 仍旧值 |
+| 事件失败不得对外使用新状态 | `set_phase` 返回 `REJECTED`，`rec.phase` 仍旧值 |
 | COMMITTED 四条件 | §2.2 门禁（token/终止证据/K2/事件） |
 | 门禁编号按 phase 唯一决定 | §2.2 `COMMIT_ATTEMPTED → T4`，`UNKNOWN → T7`，不可互换 |
 | 门禁失败不回退到 UNKNOWN | §2.3：`COMMIT_ATTEMPTED→UNKNOWN` 只由 T6 触发 |
@@ -1249,6 +1339,7 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | 语义不变 | 两种后端的连接、事务、失败与证据链语义一字未改；DDL/`INSERT`/哈希链/单调性/K1/S5/T6/T7/T8 条件未动 |
 | 分派冲突修复（十次） | `TRANSITION_DISPATCH[(old,new)]` 取代 `DURABILITY_OF[event]`；`migration_phase` 按转换键分派；三道闸 + 启动自检 `_assert_dispatch_invariants()` | §2.1 分派表 / 转换→后端表 | MC57 |
 | phase 落地异常保护（十次） | `commit_phase_in_memory()` 包裹赋值；异常 ⇒ `halt_migration`（不重发、不换转换、不判事件失败） | §2.1 伪代码 / §2.2 表 / §2.3 | MC58/MC59 |
+| halt 上行传递（十一次） | `PhaseResult` 三态（`SUCCESS`/`REJECTED`/`HALTED`）取代裸 `bool`；`halt_tail` 零写入；`emit_event`/`append_reason` 在 `rec.halted` 时拒写 | §2.1 / §2.2 分派表 | MC60/MC60b |
 
 ## 7. 测试矩阵（增量）
 
@@ -1264,7 +1355,7 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | RC | 6 | 6 | — |
 | CF | 8 | 8 | — |
 | AU | 9 | 9 | — |
-| MC | 12 | **59** | +MC13–MC18；二次修订 +MC19–MC20；三次修订 +MC21、MC15b/15c/15d、MC13b；四次修订 +MC22–MC24；五次修订 +MC25/MC26/MC26b/MC27/MC27b；六次修订 +MC34–MC37；七次修订 +MC38–MC43；八次修订 +MC44–MC47；九次修订 +MC48–MC56；十次修订 +MC57–MC59 |
+| MC | 12 | **60** | +MC13–MC18；二次修订 +MC19–MC20；三次修订 +MC21、MC15b/15c/15d、MC13b；四次修订 +MC22–MC24；五次修订 +MC25/MC26/MC26b/MC27/MC27b；六次修订 +MC34–MC37；七次修订 +MC38–MC43；八次修订 +MC44–MC47；九次修订 +MC48–MC56；十次修订 +MC57–MC59；十一次修订 +MC60（含对照 MC60b） |
 | CR | 5 | 5 | — |
 | FX | 3 | **4** | +FX4 |
 | PH | 5 | **13** | +PH6–PH11、PH9b、PH10b |
@@ -1295,7 +1386,7 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | `UNKNOWN→UNKNOWN` 禁止 | `LEGAL_TRANSITIONS` 不含该对 | §5 最后两行 | PH7/PH8 |
 | durable 事件后于 S5 | §1.3 时序表 | §5 事件时点列 | MC13 |
 | 隔离失败不写 DB | 规则 1–2、5、7 | §1.3 硬规则 / §3.1 禁令表 | MC14/MC19 |
-| 事件失败不改内存 | `set_phase` 返回 False 分支 | §2.1 表 | PH9 |
+| 事件失败不改内存 | `set_phase` 返回 `REJECTED` 分支 | §2.1 表 | PH9 |
 | COMMITTED 五条件 | §2.2 门禁（含 `hist_gate`） | §5 `UNKNOWN→COMMITTED` 行 | PH9/PH10/MC44 |
 | 补偿合法性 | `to_unknown` | §2.3 表 | PH10/PH10b/PH11 |
 | K1 四条件 | §3.1 伪代码 | §3.1 判定表 | MC15 |
@@ -1337,6 +1428,9 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | T1/T2 必进 tx_local、T6/T7/T8 必进 durable | 表值固定 + 启动自检断言 | §2.1 自检函数 | MC57 |
 | 非法分派零写入 | 三道闸 + `IllegalDurability`/`PhaseMismatch` | §2.1 闸门说明 | MC57 |
 | phase 落地异常不判事件失败 | `commit_phase_in_memory` → `halt_migration` | §2.1 伪代码 / §2.2 表 | MC58/MC59 |
+| 三态结果区分 | `PhaseResult` + 每调用点按三态分派 | §2.1 / §2.2 分派表 | MC60/MC60b |
+| `HALTED` 零数据库写入 | `halt_tail` + `rec.halted` 拒写闸 | §2.1 / §2.2 | MC60 |
+| `REJECTED` 不误触 halt | 类型区分 + 对照用例 | §2.3 / §2.5 | MC60b |
 | 独立夹具 | §4.2 | — | FX4/R10-A0/A1/A2 |
 
 **九次修订的八项全篇核对（本轮必须逐条过）**
@@ -1408,7 +1502,9 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | 29 | 状态机绕过统一入口直连后端写入 | `emit_event` 唯一入口 + 调用计数断言 | MC54/MC56 |
 | 30 | `migration_phase` 按事件名分派 → T1/T2 误落证据链或 T6 误落事务内提示 | `TRANSITION_DISPATCH[(old,new)]` + 启动自检 + 三道闸 | MC57 |
 | 31 | 事件已提交但内存 phase 落地失败被当作"事件失败" → 重发或走另一条转换 | `commit_phase_in_memory` → `halt_migration`；事件保留为事实 | MC58/MC59 |
+| 32 | halt 后上层仍把 `False` 当普通失败 → 追加 `migration_note`，掩盖"事件已提交" | `PhaseResult.HALTED` + `halt_tail` 零写入 + `rec.halted` 拒写闸 | MC60 |
+| 33 | `REJECTED` 被误升级为 halt → 可恢复路径被过度封锁 | 三态类型区分；对照用例断言 `halt_migration` 计数为 0 | MC60b |
 
 ---
 
-**v1.10 到此结束。** 十次修订合计**未编写代码、未执行迁移、未修改数据库、未修改生产配置或生产数据**；十次修订累计只处理"五项 + 两项 + 三项 + S2 异常保护 + 路径与关闭接口一致性 + β′ 跨重启证据 + 证据写入路径 + 证据完整性 + 提交结果确认 + 转换级分派与 phase 落地窗口"的状态机与伪代码矛盾。**C11–C20 全部未确认，C12 仍未被本轮视为已批准。** 文档交回总体设计最终审查；未获批准前不提交 P-1 实施计划、不进入任何实施阶段。
+**v1.10 到此结束。** 十一次修订合计**未编写代码、未执行迁移、未修改数据库、未修改生产配置或生产数据**；十一次修订累计只处理"五项 + 两项 + 三项 + S2 异常保护 + 路径与关闭接口一致性 + β′ 跨重启证据 + 证据写入路径 + 证据完整性 + 提交结果确认 + 转换级分派与 phase 落地窗口 + halt 上行传递"的状态机与伪代码矛盾。**C11–C20 全部未确认，C12 仍未被本轮视为已批准。** 文档交回总体设计最终审查；未获批准前不提交 P-1 实施计划、不进入任何实施阶段。
