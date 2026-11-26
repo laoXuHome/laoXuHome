@@ -672,7 +672,7 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 | P-1.5 | 五入口 + 二次级机制接线（A/B 分离） | 拆中间件 | PT-15/16/23 通过 |
 | P-1.6 | `migrate.py` 最小状态机（无事件链）+ 空迁移 dry-run | 删文件 | PT-09b/12/13/19/25 通过；`write_event()` 抛 `NotImplementedError` |
 | P-1.7 | 手动导入 + 维护保护 + 失败现场（隔离演练 8089） | 不影响生产 | PBT-05/06/07/08/09/10 通过；P-1.6 迁移测试不回归；无自动恢复链残余 |
-| P-1.8 | **Docker 迁移演练与交付验证**（隔离容器，不碰生产） | 删除容器与测试目录即可，无生产副作用 | §8.1 R1–R8 全通过（含 §8.2 R4-a…d）；`T_mig`≤60s；中断/失败路径均 fail-closed；四格式订阅可重建；30 分钟容器内观察无 5xx |
+| P-1.8 | **Docker 迁移演练与交付验证**（隔离容器，不碰生产） | 删除容器与测试目录即可，无生产副作用 | §8.1 R1–R8 全通过（含 §8.2 R4-a…d、§8.5 证据）；`T_mig`≤60s；中断/失败路径均 fail-closed；四格式订阅可重建；30 分钟容器内观察无 5xx |
 
 每步之间必须停下汇报，不得连做。P-1.1 之前不允许写任何代码。
 
@@ -688,8 +688,8 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 | --- | --- | --- |
 | R1 | 正常迁移 | 迁移前 `cli backup` 成功；迁移 `success` 唯一；重启后只读复核通过；四格式订阅重建；`/healthz` 200 |
 | R2 | 重复执行幂等 | 已迁移库再次启动不重复 DDL；显式拒绝或明确 no-op，不产生第二条 success |
-| R3 | 迁移中断 | 在 DDL 阶段 `docker kill`/`kill -9`；重启后 `RECOVERY_REQUIRED` + 写入 503；无自动恢复、无自动找备份 |
-| R4 | 迁移失败与恢复路径 | 见 §8.2：DDL 失败/`docker kill` 中断均进入 `RECOVERY_REQUIRED`；`import --recover --reason` 仅接受显式备份且先严格校验；全程保持写封锁；导入后完整性与逐表数据校验通过才清维护解封；失败保持封锁 |
+| R3 | 迁移中断 | B 状态源库；`TX_OPEN` 阶段真实 `docker kill -s KILL`；重启后 `RECOVERY_REQUIRED` + 写入 503；证据见 §8.5（依赖 D1–D3） |
+| R4 | 迁移失败与恢复路径 | B 状态源库；见 §8.2：DDL 失败/`docker kill` 中断均进入 `RECOVERY_REQUIRED`；`import --recover --reason` 仅接受显式备份且先严格校验；全程保持写封锁；导入后完整性与逐表数据校验通过才清维护解封；失败保持封锁 |
 | R5 | 手动回滚演练 | 迁移成功后用迁移前备份 `cli import` 回退旧结构；表集合/逐表计数/结构摘要与备份一致；订阅按旧版重建 |
 | R6 | 坏备份拒绝 | 截断/篡改/元信息缺失或内容不实配 ⇒ `verify` 与 `import` 均拒绝，目标库零改动 |
 | R7 | 句柄与写封锁 | 容器内仍有连接/句柄时导入中止（`import_self_handles_present`/`import_handles_present`），维护态保持 |
@@ -749,30 +749,108 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 | R4-c | 坏备份 | 恢复态下用截断/元信息篡改备份 ⇒ 退出码 2、目标库计数与 sha 不变、状态仍 `RECOVERY_REQUIRED` |
 | R4-d | 恢复过程异常 | S3–S7 任一注入失败 ⇒ 维护文件仍在、`writes_blocked=True`、业务 503；重启后仍 `RECOVERY_REQUIRED` |
 
-### 8.3 P-1.8 迁移内容（不得自行扩展）
+### 8.3 P-1.8 迁移内容与源库基线状态
 
-**代码现状**：`migrate.run()` 仍是 P-1.6 框架——`dry_run=False` 抛 `p17_required`，默认零 DDL；`statements` 仅供测试注入。**R1–R5 目前不具备可执行的真实迁移基础**，施工前必须先由项目方确认下表内容并在代码层补齐演练入口（本轮只定义，不改代码）。
+**代码现状**：`migrate.run()` 仍是 P-1.6 框架——`dry_run=False` 抛 `p17_required`，默认零 DDL；`statements` 仅供测试注入。**R1–R5 目前不具备可执行的真实迁移基础**，施工前必须先由项目方确认本节并在代码层补齐演练入口（本轮只定义，不改代码）。
+
+#### 8.3.1 源库状态：统一采用 **B（已有基线）**
 
 | 项 | 定义 |
 | --- | --- |
-| 源数据库版本 | `1.8.7-baseline`（`VERSION_SEQ=1`），结构 = 17 张基准业务表 + 可选 `tasks` 历史表 |
-| 目标迁移版本 | `1.10`（`VERSION_SEQ=2`），仅版本标记，**无业务表结构变更** |
-| 实际 DDL | 仅 `schema_migrations`：`CREATE TABLE IF NOT EXISTS`（9 列 + `status` CHECK + `migration_id`/`seq` 唯一约束）；由 `ensure_schema_table_transactional()` 在同一 `BEGIN IMMEDIATE` 内建表 + 插基线行 + 行数校验 |
-| 数据转换 | 无业务数据转换。`migrate.run()` 在事务内插入 `running` 行（`seq=2, version=1.10`），提交后再置 `success` |
-| 迁移前后结构差异 | 业务 17 表结构、索引、触发器**零变化**，`structure_hash` 前后相同；仅新增 `schema_migrations` 辅助表（不计入 `BASE_TABLES`/结构摘要）；`tasks` 原样保留 |
-| 预期数据变化 | `schema_migrations` 从 1 行（基线）变为 2 行（基线 + `1.10` success）；全部业务表逐表计数不变 |
+| 源库版本 | `1.8.7-baseline`（`VERSION_SEQ=1`） |
+| 业务表集合 | 17 张基准表：`settings/airports/fetch_logs/nodes/airport_filtered_nodes/test_groups/results/latency_results/share_history/schedule_history/batches/run_events/logs/speed_sources/speed_source_checks/speed_runs/speed_samples`；另加可选历史表 `tasks`（存在但非空会被基线登记拒绝，P-1.8 测试统一用"不存在"或"存在且 0 行"） |
+| `schema_migrations` | **存在**（列：`id/migration_id/seq/version/status/started_at/finished_at/detail_json`） |
+| 基线记录 | **存在且唯一**：`migration_id='1.8.7-baseline'`、`seq=1`、`version='1.8.7-baseline'`、`status='success'` |
+| `ensure_schema_table_transactional()` | P-1.8 **不执行**建表（表已存在）；该函数与 `record_baseline()` 只在测试环境**预备步骤**里调用一次，用于把 v1.8.7 副本变成 B 状态。迁移事务内不再建表 |
+| 迁移事务 DDL | **零 DDL**。`run()` 只做 `BEGIN IMMEDIATE` → 插入 `running` 行（`seq=2, version='1.10'`）→ `COMMIT` → 第二事务置 `success` |
+
+**选择 B 的理由**：P-1.6/P-1.7 的测试与 `run()` 都要求 `schema_migrations` 已存在且基线齐全（`preflight` 对"表不存在"只返回 `create_table_and_record_baseline` 建议，`run()` 并未实现自动建表）。若声称 A，则必须先在 `run()` 入口补建表+基线逻辑，属未经批准的架构追加。A（全新库首次基线）已由 P-1.2/P-1.6 的 `record_baseline()`/`preflight()` 测试覆盖，不在 P-1.8 重复。P-1.8 测试环境在**预备阶段**完成 `record_baseline()`，之后所有场景都从同一个 B 状态副本开始，**不得**在同一场景里又声称"表由迁移创建"。
+
+**执行顺序（B 状态）**：
+
+1. 预备：复制 v1.8.7 库副本 → 打开连接 → `record_baseline()`（创建表 + 基线，原子事务）→ 关闭；记录 `structure_hash`、基线行。
+2. 迁移前：`cli backup` 导出并 `verify`（B 状态备份，含基线行、无 1.10 行）。
+3. 迁移：`gate` 维护态 ACTIVE、写封锁确认、排空 → `run()` 打开事务 → `preflight` 必须 `ready`（`current_version='1.8.7-baseline'`）→ 插 `running` → `COMMIT` → 置 `success`。
+4. 迁移后：清维护、重启、只读复核 `current_version='1.10'`，17 表结构与计数不变。
+
+#### 8.3.2 迁移内容与差异
+
+| 项 | 定义 |
+| --- | --- |
+| 源版本 | `1.8.7-baseline`（`VERSION_SEQ=1`） |
+| 目标版本 | `1.10`（`VERSION_SEQ=2`），仅版本标记，**无业务表结构变更** |
+| 实际 DDL（迁移事务内） | **无**。`schema_migrations` 与基线行在预备步骤已存在 |
+| 数据转换 | 无业务数据转换；迁移事务只插入 `running` 行，提交后置 `success` |
+| 迁移前后结构差异 | 17 张业务表结构/索引/触发器**零变化**，`structure_hash` 前后相同；`schema_migrations` 结构与基线行不变；`tasks` 原样 |
+| 预期数据变化 | `schema_migrations` 从 1 行变为 2 行；全部业务表逐表计数不变 |
 | 预期不变项 | 节点身份/健康判断/评分逻辑、订阅产物格式、`settings`/`airports`/`nodes` 等全部行内容 |
-| 成功判据 | 事务提交成功；`status='success'` 行恰一条且 `current_version='1.10'`；无 `running`/`failed`；结构摘要与计数不变 |
+| 成功判据 | 事务提交成功；`status='success'` 行恰一条且 `current_version='1.10'`；无 `running`/`failed`；结构与计数不变 |
 | 失败判据 | 事务内异常 → `ROLLBACK` 确认 → `status='failed'` → `RECOVERY_REQUIRED`；回滚/复核不可确认 → halt，不写伪造行 |
 | 重复执行判据 | 已成功后再次启动：`preflight` 返回 `version_mismatch`（期望 `1.8.7-baseline`，实际 `1.10`）⇒ 拒绝，不新增任何行；不得改写成"静默成功" |
 
-> 若后续批准真实业务 DDL（例如新增列/索引），必须先登记结构 profile、更新本节与 `structure_profile_for` 白名单，再施工；本阶段不包含任何未列出的业务数据迁移。
+#### 8.3.3 R1–R5 使用的源库状态
+
+| 场景 | 源库状态 | 说明 |
+| --- | --- | --- |
+| R1 正常迁移 | B | 同一个 B 副本；迁移前已完成备份 |
+| R2 重复执行 | B 经 R1 成功后（`current_version=1.10`） | 复用 R1 产物，验证拒绝且不新增行 |
+| R3 `docker kill` 中断 | B | 全新 B 副本，在 `TX_OPEN` 阶段强杀 |
+| R4 迁移失败/恢复 | B | 全新 B 副本，注入非法 DDL；恢复用其迁移前备份（B 状态） |
+| R5 手动回滚 | B | 使用 R1 的迁移前备份（B 状态，仅基线行），回滚后应回到 `1.8.7-baseline` |
+
+> 任一场景只能从 B 状态出发；不得在 R1–R5 中混用"表不存在/需建表"的 A 描述。
 
 ### 8.4 迁移窗口计时口径
 
 **迁移执行窗口 `T_mig`（≤60s 的对象）**：起点 = `confirm_writes_blocked()` 首次返回成功；终点 = `migrate.run()` 返回 `committed` 且迁移连接关闭确认完成。包含排空、事务、行状态落库；不含迁移前备份导出与迁移后人工清维护/重启。
 
 **停写窗口 `T_block`（记录实测，不设新指标）**：起点同上；终点 = 删除维护文件并 `gate.release()` 成功。包含人工确认与重启，仅作记录，不用 ≤60s 判定。
+
+### 8.5 `docker kill` 后的持久化恢复证据（R3/R4-b）
+
+#### 8.5.1 现状核对结论
+
+| 核对项 | 当前代码事实 | 后果 |
+| --- | --- | --- |
+| DDL 事务未提交即被 SIGKILL | SQLite 崩溃回滚，事务内插入的 `running` 行消失；若基线表在预备步骤已建，则只剩基线行 | DB 不能证明"迁移曾开始" |
+| `maintenance.json` 已写入 | `maint.set_maintenance()` 写 `maintenance=true/migration_id/phase/nonce/reason/pid/since` | 重启后 `maintenance_state()` 见 `maintenance=true` ⇒ 返回 **ACTIVE**，不是 `RECOVERY_REQUIRED` |
+| 进程在写维护与确认封锁之间退出 | 维护文件已是 ACTIVE；无事务、无 running 行 | 仍是 ACTIVE，无法与"正常维护等待中"区分 |
+| 迁移 phase 落盘 | `set_phase_memory()` 只改内存 `rec.phase`，**不回写 maintenance.json** | 文件 phase 永远是 `PREPARED`，重启丢失 TX_OPEN/COMMIT_ATTEMPTED 证据 |
+| 内存状态 | 进程死亡即丢失 | 只能依赖文件 + DB 行 + 迁移锁 |
+
+**结论**：以当前已批准架构，**无法可靠产生 R4-b 所需的 `RECOVERY_REQUIRED` 持久化证据**，也不能区分"中断"与"正常维护"。必须补充以下设计后才可施工，禁止用 mock 或"预期结果"代替。
+
+#### 8.5.2 需批准的设计补充（D1–D3）
+
+| 编号 | 补充 | 具体口径 |
+| --- | --- | --- |
+| D1 | 维护文件持久化 phase | 新增 `maint.update_phase(rec)`：在 T1（`BEGIN IMMEDIATE` 成功后）写 `TX_OPEN`、T2 写 `COMMIT_ATTEMPTED`、success 后写 `COMMITTED`、halt 写 `UNKNOWN`；写法与 `set_maintenance` 相同（tmp → fsync → `os.replace` → 目录 fsync → 回读），nonce 不变 |
+| D2 | 启动中断分类 | 启动时先探测 `migration_run_lock`：**锁被持有** ⇒ 另一实例正在迁移，拒绝启动（`already_running`），不误判；**锁空闲** ∧ 维护文件 `maintenance=true` ⇒ 上一进程已死亡 ⇒ 按 phase 判定为中断，返回 `RECOVERY_REQUIRED`（新增派生规则，不改 `maintenance_incomplete()` 的 DB 判定） |
+| D3 | 重启即封锁 | `RECOVERY_REQUIRED`/`ACTIVE` 时在 `init_db()`、调度器、HTTP 监听之前调用 `pool.block_writes(REASON_RECOVERY/MAINTENANCE)` 并确认；业务写 503，只读接口可用 |
+
+> D1–D3 是对 v1.10 维护态语义的**增量补充**，需项目方批准后才能进入 P-1.8 施工；未批准前 R3/R4-b 不能宣称可验证。
+
+#### 8.5.3 重启后状态判定表（D1–D3 生效后）
+
+| 维护文件 phase | 迁移锁 | `schema_migrations` 行 | 判定 | 依据 |
+| --- | --- | --- | --- | --- |
+| `PREPARED` | 空闲 | 仅基线 | `RECOVERY_REQUIRED`（`interrupted_before_tx`） | 进程在事务前死亡；无 DB 写，但维护态必须人工确认后才可清除 |
+| `TX_OPEN` | 空闲 | 仅基线（running 被回滚） | `RECOVERY_REQUIRED`（`interrupted_in_tx`） | 文件 phase 是事务已开始的持久证据 |
+| `COMMIT_ATTEMPTED` | 空闲 | 基线 + `running` | `RECOVERY_REQUIRED`（`interrupted_before_finalize`） | running 行未被置 success |
+| `COMMITTED` | 空闲 | 基线 + `success(1.10)` | `RECOVERY_REQUIRED`（`success_pending_release`） | 迁移已成功但未清维护；人工确认后按成功路径收尾，不需导入 |
+| `UNKNOWN` | 空闲 | 任意 | `RECOVERY_REQUIRED` | 结果不确定，只允许人工导入恢复 |
+| 任意 | 被持有 | 任意 | 拒绝启动（`already_running`） | 正常进行中的迁移，不得判失败 |
+| 文件缺失 | 空闲 | 含 `running`/`failed` | `RECOVERY_REQUIRED` | `judge_by_migration_rows()` 的既有 DB 证据 |
+
+**避免误判**：正常迁移期间进程存活并持有迁移锁，重启不会发生；一旦重启，锁必然已释放，故"锁空闲 + 维护文件存在"就是中断的充分判据。`PREPARED` 与"操作员刚写好维护、尚未开始事务"在重启后不可区分，按 fail-closed 统一判 `RECOVERY_REQUIRED`，由人工用 `status` 查看 phase 后决定继续或导入。
+
+#### 8.5.4 R3/R4-b 的真实测试方法（非 mock）
+
+1. 启动测试容器，执行迁移；宿主机轮询 bind 挂载的 `maintenance.json`，读到 `phase='TX_OPEN'` 时执行 `docker kill --signal=KILL <container>`（真实 SIGKILL，无测试钩子）。
+2. 重启容器，读取三份**外部证据**：维护文件（phase/nonce/pid）、`sqlite3` 直读测试库（`schema_migrations` 行集合、17 表计数）、`cli status --json`（`state`/`writes_blocked`）。
+3. 断言：`state=RECOVERY_REQUIRED`；`writes_blocked=true`；对写接口发起请求返回 503；`backup` 目录无新增自动恢复文件；DB 无 success(1.10)，running 行按 kill 点符合预期（回滚后应无）。
+4. 再执行 `import --recover --file <迁移前B备份>`，断言转为 `INACTIVE`、计数回到 B 状态、重启后只读复核通过。
+5. 若 D1–D3 未实现，本项**不得标记通过**，只能记为"设计缺口待批准"。
 
 ---
 
@@ -821,6 +899,8 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 ③ **P-4**（`integrity_check` 与 `journal_mode`）——决定库本身是否允许动手。
 
 **待补能力（本轮不改，登记备查）**：若 P-10 实测显示 `/healthz` 没有版本字段，则"健康端点自带版本"属能力缺口，记为待补（P-1 后的独立小改动，不进本轮范围）；在此之前基线版本只能靠 `config.VERSION` + image digest 三值确定，且**不得**对外声称已做四值核对。
+
+**P-1.8 第三轮修订（第 22 次修订，2026-11-26）**：明确源库统一采用 B 状态（`schema_migrations` 与基线行在预备步骤创建，迁移事务零 DDL），给出表集合、执行顺序与 R1–R5 映射；新增 §8.5 核对 `docker kill` 持久化证据，明确指出当前架构无法区分中断与正常维护，提出 D1–D3 设计补充（维护文件持久化 phase、锁空闲+维护文件判定中断、重启即封锁）与真实 SIGKILL 测试方法。D1–D3 需另行批准，未批准前 R3/R4-b 不得标记通过。
 
 **P-1.8 第二轮修订（第 21 次修订，2026-11-26）**：清理 §6 第 4 步"真机导入/维护窗口"残留，改为独立 Docker 测试容器导入演练；新增 §8.2 `RECOVERY_REQUIRED` 授权恢复路径（状态转换表 + R4-a…d）；新增 §8.3 迁移内容定义（源/目标版本、DDL、结构差异、数据变化、成功/失败/重复判据，明确 P-1.6 空迁移不足以支撑 R1–R5）；新增 §8.4 `T_mig`/`T_block` 计时口径；§10 旧 P-1.1/P-7 停止条件标注为历史；登记三处代码注释旧表述待施工修正。
 

@@ -2024,7 +2024,15 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 - 失败：任一环节失败均保持维护文件与写封锁，状态仍 `RECOVERY_REQUIRED`，不自动开放写入；导入的备份若自身含 `running`/`failed` 行，拒绝解封（`recovery_backup_incomplete`）。
 - 验收：DDL 失败后恢复、`docker kill` 中断后恢复、坏备份在恢复态仍拒绝且库不变、恢复过程异常时封锁保持。
 
-**迁移内容（不得自行扩展）**：源 `1.8.7-baseline`（`VERSION_SEQ=1`，17 张基准表 + 可选 `tasks`）→ 目标 `1.10`（`VERSION_SEQ=2`）。**无业务表结构变更**；唯一 DDL 是 `schema_migrations` 的 `CREATE TABLE IF NOT EXISTS` 及基线登记，迁移事务只插入 `running` 行、提交后置 `success`。前后 `structure_hash` 相同、业务逐表计数不变，`schema_migrations` 增加 1 行。当前 `migrate.run()` 仍是 P-1.6 空迁移框架（`dry_run=False` 拒绝、零 DDL），R1–R5 施工前必须先由项目方确认本节并补齐演练入口。
+**迁移内容与源库状态（统一采用 B，不得自行扩展）**：源库为 v1.8.7 结构（`1.8.7-baseline`，`VERSION_SEQ=1`）：17 张基准业务表 + 可选 `tasks`；**`schema_migrations` 已存在且恰有一条基线成功行**（`migration_id/version='1.8.7-baseline'`、`seq=1`、`status='success'`）。该表与基线由测试环境的**预备步骤**调用 `record_baseline()`/`ensure_schema_table_transactional()` 创建；**迁移事务内零 DDL、不建表**，只插入 `running` 行（`seq=2, version='1.10'`），提交后置 `success`。目标版本 `1.10`（`VERSION_SEQ=2`），仅版本标记，无业务结构变更；前后 `structure_hash` 相同、业务表计数不变，`schema_migrations` 1→2 行。R1–R5 全部从同一 B 状态副本出发；A（表不存在、首次建基线）不在 P-1.8 范围，由 P-1.2/P-1.6 覆盖。当前 `migrate.run()` 仍是 P-1.6 空迁移框架（`dry_run=False` 拒绝、零 DDL），施工前须由项目方确认本节并补齐演练入口。
+
+**`docker kill` 持久化证据缺口**：当前 `maint.set_maintenance()` 只写一次 `phase='PREPARED'`，`set_phase_memory()` 不回写文件；SIGKILL 后重启，`maintenance_state()` 见 `maintenance=true` 直接返回 `ACTIVE`，无法与正常维护区分，也没有 `RECOVERY_REQUIRED` 的持久证据。必须以 D1–D3 补齐后才可验证 R3/R4-b：
+
+- **D1**：维护文件持久化 phase——`BEGIN IMMEDIATE` 成功后写 `TX_OPEN`，提交尝试前写 `COMMIT_ATTEMPTED`，成功后写 `COMMITTED`，halt 写 `UNKNOWN`（原子写 + fsync + 回读，nonce 不变）。
+- **D2**：启动中断分类——迁移锁被持有 ⇒ 另一实例在迁移，拒绝启动；锁空闲且维护文件 `maintenance=true` ⇒ 上一进程已死亡，按 phase 判 `RECOVERY_REQUIRED`（新增派生规则，不改 DB 行判定）。
+- **D3**：重启即封锁——`RECOVERY_REQUIRED`/`ACTIVE` 时在 `init_db()`、调度器和 HTTP 监听之前封锁写入并确认，业务写 503。
+
+判定表：`PREPARED`→`interrupted_before_tx`；`TX_OPEN`→`interrupted_in_tx`；`COMMIT_ATTEMPTED`→`interrupted_before_finalize`；`COMMITTED`→`success_pending_release`；`UNKNOWN`→人工导入恢复；锁被持有→拒绝启动；文件缺失且 DB 有 `running`/`failed`→`RECOVERY_REQUIRED`。R4-b 必须用真实 SIGKILL + 维护文件/DB/CLI 三份外部证据断言，禁止 mock；D1–D3 未批准前 R3/R4-b 不得标记通过。
 
 **前置条件**：P-1.7 已验收（`a62aeb2`）；P-1.3–P-1.6 回归全绿；独立 bridge 网络、独立端口 8089、独立 bind 目录与 `STATE_DIR`、禁用自动重启；测试库为离线副本或同构合成库，禁止挂载生产目录；仅在测试目录验证 `os.replace`/`fsync`；记录镜像 digest 与 `config.VERSION`。
 
@@ -2036,4 +2044,4 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 
 **与 P-1.7 的关系**：P-1.7 的备份/导入/维护保护是本阶段的被验证对象，不因本阶段改写；P-1.8 不新增自动恢复机制，回滚一律走 `cli import` 手动路径。
 
-**v1.10 到此结束。** 二十一次修订合计**未编写代码、未执行迁移、未修改数据库、未修改生产配置或生产数据**；前十九次修订累计只处理"五项 + 两项 + 三项 + S2 异常保护 + 路径与关闭接口一致性 + β′ 跨重启证据 + 证据写入路径 + 证据完整性 + 提交结果确认 + 转换级分派与 phase 落地窗口 + halt 上行传递 + C 类不降级与 halt 故障安全 + 语义统一与 maintenance 持久化一致性 + 裸 bool 清理、维护态单一来源与自检去 assert + 维护态读取者职责分离 + 维护态三态判定在统一入口闭环、判定与写入确认分离 + 维护文件读取分类四态化（缺失/损坏/不可读严格区分）+ false 分支结构校验前置、since 有限正数严格化、since 整数/浮点分治（超大整数不触发 OverflowError、结构检查不抛出）"的状态机与伪代码矛盾；第 20 次修订改 P-1.8 阶段定义（生产窗口 → Docker 迁移演练与交付验证，见 §12）；第 21 次修订补 R4 授权恢复路径、迁移内容定义、计时口径与生产表述清理，不涉及代码与 P-1.7 已验收内容。**C11–C20 全部未确认，C12 仍未被本轮视为已批准。** 文档交回总体设计最终审查；未获批准前不提交 P-1 实施计划、不进入任何实施阶段。
+**v1.10 到此结束。** 二十二次修订合计**未编写代码、未执行迁移、未修改数据库、未修改生产配置或生产数据**；前十九次修订累计只处理"五项 + 两项 + 三项 + S2 异常保护 + 路径与关闭接口一致性 + β′ 跨重启证据 + 证据写入路径 + 证据完整性 + 提交结果确认 + 转换级分派与 phase 落地窗口 + halt 上行传递 + C 类不降级与 halt 故障安全 + 语义统一与 maintenance 持久化一致性 + 裸 bool 清理、维护态单一来源与自检去 assert + 维护态读取者职责分离 + 维护态三态判定在统一入口闭环、判定与写入确认分离 + 维护文件读取分类四态化（缺失/损坏/不可读严格区分）+ false 分支结构校验前置、since 有限正数严格化、since 整数/浮点分治（超大整数不触发 OverflowError、结构检查不抛出）"的状态机与伪代码矛盾；第 20 次修订改 P-1.8 阶段定义（生产窗口 → Docker 迁移演练与交付验证，见 §12）；第 21 次修订补 R4 授权恢复路径、迁移内容定义、计时口径与生产表述清理；第 22 次修订明确源库统一为 B 状态（迁移事务零 DDL）、新增 `docker kill` 持久证据缺口与 D1–D3 设计补充，不涉及代码与 P-1.7 已验收内容。**C11–C20 全部未确认，C12 仍未被本轮视为已批准。** 文档交回总体设计最终审查；未获批准前不提交 P-1 实施计划、不进入任何实施阶段。
