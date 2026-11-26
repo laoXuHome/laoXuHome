@@ -188,3 +188,42 @@ NODEPOOL_P7_APPROVED=1 sh NodePoolME-P-1-生产探针-v1.10.sh
 **P-7 状态**：`未执行（等待批准）`，且需生产可达后重跑第 5 段。
 
 **下一步**：等你在 NAS 上跑一次并把 log 回贴（或给 SSH 授权），我据此产出"生产基线报告 + §1.2.7 回填表 + 能否进入 P-1.2 的结论"。本轮到此停止，不进入 P-1.2。
+
+
+---
+
+## 附录 A：探针 r2 修正与自检（本轮）
+
+**修正点（对应本轮 7 条要求）**
+
+| # | 修正 | 落地 |
+| --- | --- | --- |
+| 1 | 不假设容器名 | `docker ps` 按 `nodepool` 过滤：0 个 ⇒ 停止；>1 个 ⇒ 停止并列出候选（可用 `NODEPOOL_CONTAINER` 指定）；并校验 `State.Status=running` |
+| 2 | 宿主机↔容器路径由挂载推导 | `docker inspect .Mounts` 建映射表，按**最长目标前缀**匹配把容器路径翻译成宿主路径；非 `bind` 挂载单独标注 |
+| 3 | 路径不硬编码 | 先用容器环境变量推 `data/db/backup/config/logs/state` 六个路径并检查存在性，再导入 `config` 取权威值，两者不一致即打印 `PATH_MISMATCH`；`STATE_DIR` 来源标注 `env` 或 `默认 <DATA_DIR>/state` |
+| 4 | P-10 用不可变 ID | `docker inspect .Image` 取 image ID → `docker image inspect <id> RepoDigests`；标签当前指向与该 ID 不一致时打 `TAG_DRIFT`；digest 0 条 ⇒ `ABSENT`（禁登记基线），>1 条 ⇒ `AMBIGUOUS`；与 `config.VERSION`、`/healthz.version` 并列输出 |
+| 5 | P-7 区分两侧路径 | 打印 `host_state` / `container_state` / `state_exists_host`；`STATE_DIR` 无映射或不存在 ⇒ 直接跳过并提示"不会创建目录" |
+| 6 | 只读属性保持 | 第 4/4b/5/5b/6/8/9/10 段全部只读（无 `wal_checkpoint`）；P-7 仍需 `NODEPOOL_P7_APPROVED=1` |
+| 7 | 目标不明即停 | 容器 0/多个、非 running、挂载为空、DB/backup 映射失败、`backend.config` 导入失败、路径解析不完整 ⇒ 一律 `exit 2` 且不写文件 |
+
+**自检方式**：本地用「假 docker」壳（`ps/inspect/image inspect/exec` 均按真实输出格式应答、挂载指向 `/tmp/p1h2`）+ 真实 `backend.config` + 开发库副本，跑完整链路；另对 `map_host()` 做单元测试。
+
+```
+容器识别        nodepool / running / restart=unless-stopped
+挂载映射        /tmp/p1h2|/tmp/p1h2|bind, /tmp/p1h2/backup|...   （identity 情形）
+map_host 单测   /data/nodepool.db → /opt/nodepool/data/nodepool.db
+                /data/state/maintenance.json → …/data/state/maintenance.json（嵌套挂载胜出）
+                /config/x → 空（未映射，正确拒绝）
+IMPORT_MKDIR_RISK []    PATH_MISMATCH []
+digests_for_repo 1  → VERDICT_digest OK
+table_count 19   integrity ok   data_version_changed False
+P-7 状态        未执行（等待批准）
+P-7（批准但目录不存在）→ 未执行（不创建目录），事后 ls 确认目录仍不存在
+```
+
+**自检中发现的两处真实细节（已写入脚本注释）**
+
+1. `backend/config.py:137-138` 在**导入时**对 `DATA_DIR/CONFIG_DIR/LOG_DIR/BACKUP_DIR/SUB_DIR` 执行 `mkdir(parents=True, exist_ok=True)`。生产容器里这些目录都存在，属 no-op；但脚本仍先检查存在性并打印 `IMPORT_MKDIR_RISK`，避免"探针顺手建目录"。`STATE_DIR` **不在**这套 mkdir 里（`STATE_DIR_AUTOCREATE false`），所以 P-7 不可能被导入副作用偷偷建出来。
+2. `logs` 表无 `category` 列（`id, ts, level, source, message`），发布记录只能按 `source`/`message` 文本检索。
+
+**未执行的分支**：P-7 的写入段（本轮按要求不做任何写测试），因此 `ATOMIC_WRITE_SUPPORTED` 结论仍待你在生产批准后取得。
