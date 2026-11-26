@@ -10,6 +10,7 @@
 **三次修订（Final Closure Fixes）**：① quarantine 后普通 SQL 全拒导致原 `ROLLBACK` 执行不到 → 新增 `rollback_for_migration()` 单点通道；② K1 统一为写库唯一闸门，K1 不成立一律不写事件、phase 停 `COMMIT_ATTEMPTED`；③ `UNKNOWN → TX_ROLLED_BACK` 收紧为五条件并新增 T8′。改动点见 §0.2。
 **四次修订（S2 异常保护）**：`in_transaction` 读取、`quarantine()`、回滚通道各自独立异常边界；`close()` 兜底必执行；隔离失败即 K1=False，严格按 T6′ 处理。改动点见 §0.3。
 **五次修订（Final State-Machine Closure）**：① 拆开路径 α（进程内 COMMIT 异常，先 T6 → UNKNOWN，再只走 T7/T8）与路径 β（崩溃恢复，直接从 `COMMIT_ATTEMPTED` 走 T4/T5），`T4/T5` 不再出现在异常路径；② 关闭接口统一为 `conn_wrapper.close()`，`is_closed` 只在底层成功后置位。改动点见 §0.4。
+**六次修订（β′ 跨重启证据）**：T6 事件必须持久化 `k1_proof`、`s5_result`、单调 `s5_failed_ever` 等证据；β′ 启动必须 E1–E3 校验，不得凭 `phase=UNKNOWN` 推断 K1 历史；S5 失败历史永久可追溯且不可清除。改动点见 §0.5。
 
 ---
 
@@ -48,6 +49,14 @@
 | P0-1 路径分离 | §1.2 路径归属表 + T4/T4′ 改写、§1.3（α/β 两套时序 + 硬规则 3）、§2.2（编号按 phase 决定）、§2.3、§5（新增路径列）、MC25/MC26/MC26b | 路径 α（进程内 COMMIT 异常）只出 T6/T6′ 与 T7/T7′/T8/T8′；路径 β（崩溃恢复）只出 T4/T4′/T5，且其首个 durable 事件即结论事件 |
 | P0-2 关闭接口统一 | §3.1 对象关系与契约表、关闭后读取禁令、伪代码 ④、§1.3 S4、MC27/MC27b | 迁移流程统一 `conn_wrapper.close()`；底层成功才置 `is_closed=True`；底层抛错不得伪造；关闭后不读 `conn.in_transaction` |
 
+### 0.5 六次修订改动点（β′ 跨重启证据）
+
+| 项 | 位置 | 改动 |
+| --- | --- | --- |
+| T6 事件证据字段 | §1.4 必填字段表 | `migration_id`、`old/new_phase`、`k1_proof`（四布尔）、`s5_result`、单调 `s5_failed_ever`、`seq`/`prev_sha`、`ts`/`token_fp` |
+| β′ 启动校验 | §1.4 E1–E3、§2.2 β′ 分支、§5 新增行 | 缺证据/不全/不符 → 禁止 T7/T8，停 `UNKNOWN`，一条 `evidence_unverified` |
+| S5 失败历史 | §1.4 历史标记规则、§3.2、§3.3、MC34/MC37 | 永久 true、不得清除、拒写清除事件、只认事件流 |
+
 ### 0.3 四次修订改动点（S2 异常保护）
 
 | 项 | 位置 | 改动 |
@@ -84,10 +93,10 @@
 | T4′ | `COMMIT_ATTEMPTED → （无转换）`（路径 β 门禁不满足） | `K1_β` 不成立 / S5 失败 / 结论条件不全 / 事件失败 | — | `K1_β` 成立 → 可写 `migration_note`；不成立 → 只写 `migration-fault.log`；phase 停留 `COMMIT_ATTEMPTED`；保守恢复 |
 | T6 | `COMMIT_ATTEMPTED → UNKNOWN` | COMMIT 抛异常 ∧ **K1 成立**（S5 成功或失败均可） | **S5 之后**（唯一时点） | 事件写失败 → 见 §2.4，仍保守恢复 |
 | T6′ | `COMMIT_ATTEMPTED → （无转换）` | COMMIT 抛异常 ∧ **K1 不成立**（无论 S5 是否成功） | — | 不写任何 DB 事件、不调 `set_phase`；phase 停留 `COMMIT_ATTEMPTED`；只写 `migration-fault.log`；maintenance + 保守恢复/待人工 |
-| T7 | `UNKNOWN → COMMITTED` | 隔离后 token 可见 **∧ K1 成立 ∧ S5 成功 ∧ `durable` 事件写入成功**（四条件缺一不可） | 隔离完成后 | 任一不满足 → 停留 `UNKNOWN` + 保守恢复 |
-| T7′ | `UNKNOWN → COMMITTED`（此前 S5 失败过） | **禁止**——即使后续 token 可见 | — | 保持 `UNKNOWN`，继续保守恢复 |
-| T8 | `UNKNOWN → TX_ROLLED_BACK` | token 不可见 **∧ 迁移对象不可见 ∧ K1 成立 ∧ S5 成功 ∧ `durable` 事件写入成功**（五条件缺一不可） | 隔离完成后 | 任一不满足 → 停留 `UNKNOWN` + 保守恢复 |
-| T8′ | `UNKNOWN → TX_ROLLED_BACK`（此前 S5 失败过） | **禁止**——即使后续 token 与迁移对象均不可见 | — | 保持 `UNKNOWN`，继续保守恢复；不写 success、不开放业务写入 |
+| T7 | `UNKNOWN → COMMITTED` | token 可见 **∧ K1 成立 ∧ S5 成功 ∧ `durable` 事件写入成功**（四条件）；若为 β′ 入口，另需 **E1–E3 通过 ∧ `s5_failed=False`** | 隔离完成后 / β′ 校验后 | 任一不满足 → 停留 `UNKNOWN` + 保守恢复 |
+| T7′ | `UNKNOWN → COMMITTED`（此前 S5 失败过，含 β′ 由事件流恢复出 `s5_failed=True`） | **禁止**——即使后续 token 可见、后续 S5 探测成功 | — | 保持 `UNKNOWN`，继续保守恢复 |
+| T8 | `UNKNOWN → TX_ROLLED_BACK` | token 不可见 **∧ 迁移对象不可见 ∧ K1 成立 ∧ S5 成功 ∧ `durable` 事件写入成功**（五条件）；β′ 入口另需 **E1–E3 通过 ∧ `s5_failed=False`** | 隔离完成后 / β′ 校验后 | 任一不满足 → 停留 `UNKNOWN` + 保守恢复 |
+| T8′ | `UNKNOWN → TX_ROLLED_BACK`（此前 S5 失败过，含 β′ 由事件流恢复出 `s5_failed=True`） | **禁止**——即使后续 token 与迁移对象均不可见、后续 S5 探测成功 | — | 保持 `UNKNOWN`，继续保守恢复；不写 success、不开放业务写入 |
 | — | **`UNKNOWN → UNKNOWN` 禁止** | 需要追加新原因 | — | 用 `append_reason()` 写独立事件（`migration_note`），**不改 phase** |
 
 **路径归属（本轮定稿，两个入口互不混用）**
@@ -96,7 +105,7 @@
 | --- | --- | --- | --- |
 | **α：进程内 COMMIT 异常** | 本进程执行了 COMMIT 且抛异常 | `T6`（K1 成立）或 `T6′`（K1 不成立）→ 之后仅 `T7/T7′/T8/T8′` | **不得**调用 `T4/T5`；不得跳过 `UNKNOWN` 直接判 `COMMITTED`/`TX_ROLLED_BACK` |
 | **β：崩溃/重启恢复** | 进程启动时持久 `phase = COMMIT_ATTEMPTED`，且**本进程未执行过 COMMIT** | `T4/T4′` 或 `T5/T4′` | **不得**调用 `T6`（没有 COMMIT 异常）、**不得**调用 `T7/T8`（phase 不是 `UNKNOWN`）；不得先"降到 UNKNOWN"再判 |
-| β′：恢复时持久 phase 已是 `UNKNOWN` | 启动读到 `UNKNOWN` | 仅 `T7/T7′/T8/T8′` | 不得调用 `T4/T5` |
+| **β′：恢复时持久 phase 已是 `UNKNOWN`** | 启动读到 `UNKNOWN` ∧ **E1–E3 校验通过**（§1.4） | 仅 `T7/T7′/T8/T8′`；`s5_failed` 由事件流恢复 | 不得调用 `T4/T5`；**E1–E3 任一不过即禁止 T7/T8**；不得仅凭 `phase=UNKNOWN` 推断 K1 历史 |
 
 > `K1_β`（恢复路径的原连接终止证明）：进程启动时**不存在**上一进程的原连接。以"单实例锁已取得 ∧ 启动瞬间迁移连接表为空 ∧ 本进程此后未打开过迁移写连接"证明，记 `k1_beta = True`；任一无法确认则 `k1_beta = False` → `T4′`。**不得**用"进程重启了"当作证明，也不用 `is_closed` 之类只对存活对象有意义的标志。
 
@@ -126,7 +135,7 @@ def append_reason(rec, code, detail):
 
 1. 隔离未确认前，**禁止**用独立连接写任何 `durable` 事件（SQLite 单写者：第二写者会 `SQLITE_BUSY`，且失败会污染恢复判断）；
 2. 隔离未确认时，故障记录走**非数据库通道**：`<data_dir>/migration-fault.log`（追加写、含 `migration_id/token/reason/ts`），并在进程退出码中体现；
-3. 隔离/恢复确认后的第一个 `durable` 事件按路径固定：**路径 α** 必须是 `COMMIT_ATTEMPTED→UNKNOWN`（T6）；**路径 β** 必须是 `→COMMITTED`（T4）或 `→TX_ROLLED_BACK`（T5）；**路径 β′** 是 `UNKNOWN→COMMITTED`（T7）或 `UNKNOWN→TX_ROLLED_BACK`（T8）。不得在未定义的条件下跳过本路径的首个事件，也不得跨路径套用；
+3. 隔离/恢复确认后的第一个 `durable` 事件按路径固定：**路径 α** 必须是 `COMMIT_ATTEMPTED→UNKNOWN`（T6）；**路径 β** 必须是 `→COMMITTED`（T4）或 `→TX_ROLLED_BACK`（T5）；**路径 β′** 是 `UNKNOWN→COMMITTED`（T7）或 `UNKNOWN→TX_ROLLED_BACK`（T8），且写之前必须先完成 E1–E3 校验（§1.4）。不得在未定义的条件下跳过本路径的首个事件，也不得跨路径套用；
 4. 所有 `durable` 写都用短 `busy_timeout`（≤500ms）+ 单次尝试，不重试；
 5. **K1 未确认期间的任何异常（含 `rollback_for_migration()` 失败、`close()` 失败）一律只写 `migration-fault.log`**，禁止 `append_reason()` / `durable_write_event()` / 任何 `INSERT`——因为此时原连接可能仍持写锁，写库会 `SQLITE_BUSY` 并把"写不进去"误当成"状态异常"；
 6. S7 判定必须**同时**复核 K1、S5 与事件写入成功：走 T7（`UNKNOWN → COMMITTED`）时 S5 曾失败即永久停留 `UNKNOWN`（T7′）；走 T8（`UNKNOWN → TX_ROLLED_BACK`）时 S5 曾失败同样禁止（T8′），即使 token 与对象均不可见；
@@ -159,10 +168,58 @@ def append_reason(rec, code, detail):
 
 > 路径 β **没有** `→UNKNOWN` 这一步：它不是"COMMIT 结果一度未知"的现场（现场在上一进程），持久 `COMMIT_ATTEMPTED` 本身就是唯一已知事实，因此 R4 直接给出结论。反过来说，只要走的是路径 α，就**必须**先落 `→UNKNOWN`，不得以"token 已经可见"为由跳过。
 
-### 1.4 测试（MC13–MC14、MC25–MC26b、PH6–PH8）
+### 1.4 β′ 的跨重启证据（本轮新增）
+
+**问题**：路径 α 在 K1 成立、S5 失败时执行 T6，把 phase 落成 `UNKNOWN`。若随后进程崩溃，重启进入路径 β′，新进程**没有**上一进程的 `k1`、`s5_failed` 等内存变量。若 β′ 只看 `phase == UNKNOWN` 就判 T7/T8，等于凭空假设"上一进程 K1 曾成立、S5 从未失败"——而这两件事都可能不成立。
+
+**原则**：`UNKNOWN` 只是"结论未知"的标记，**不携带任何证明**。证明必须来自与该 `migration_id` 绑定的**持久事件**，且必须能被 β′ 独立校验。
+
+**T6 事件的必填证据（durable，缺一即无效）**
+
+| 字段 | 内容 | β′ 校验方式 |
+| --- | --- | --- |
+| `migration_id` | 本次迁移标识 | 必须与当前 `migration_id` 完全一致 |
+| `old_phase` / `new_phase` | `COMMIT_ATTEMPTED` / `UNKNOWN` | 两者必须精确匹配；`new_phase` 非 `UNKNOWN` 即判"与当前 phase 不匹配" |
+| `k1_proof` | `{quarantined:true, close_ok:true, is_closed:true, no_tx_read_after_close:true}` 四个布尔 + `evidence_ts` | 四者必须全为 `true` 且字段齐备；缺字段按"无法验证"处理 |
+| `s5_result` | `"ok"` / `"failed"` / `"not_run"` | 用于解释当次探测；`not_run` 不得当作 `ok` |
+| `s5_failed_ever` | 布尔，**单调不减** | 见下方"历史失败标记" |
+| `seq` / `prev_sha` | 事件序号与上一事件规范化 JSON 的 sha256 | `seq` 必须连续 +1、`prev_sha` 必须与上一事件匹配；断链即判"证据不可验证" |
+| `ts` / `token_fp` | 事件时间、token 指纹（不含 token 明文） | `ts` 必须落在该迁移时间窗内；`token_fp` 与凭据行一致 |
+
+**S5 失败历史（跨进程、跨重启、不可清除）**
+
+1. `s5_failed_ever` 一旦为 `true`，**永久为 `true`**：后续任何 `migration_phase` 与 `migration_note` 事件都必须携带"≥ 旧值"的该字段，写入前校验单调性，违反即拒绝写事件（`EvidenceMonotonicityViolation`）；
+2. `S5` 后续成功**不得**清除该标记：成功只允许追加 `probe_ok` 记录（`s5_result="ok"`、`s5_failed_ever` 沿用旧值），**禁止**写任何"清除/重置"语义的事件；
+3. β′ 恢复时取该 `migration_id` 全部事件中 `s5_failed_ever` 的**逻辑或（任一 true 即 true）**，恢复为 `s5_failed = True`；
+4. 该状态**不得**存放在仅进程内存或普通易失日志中；`migration-fault.log` 只作辅助排查，不作为 β′ 的判定依据。
+
+**β′ 启动校验（E1–E3，全过才允许 T7/T8）**
+
+| 检查 | 条件 | 不通过时 |
+| --- | --- | --- |
+| E1 存在性 | 该 `migration_id` 存在 `migration_phase` 事件且 `new_phase=UNKNOWN`、`old_phase=COMMIT_ATTEMPTED` | **禁止** T7/T8 |
+| E2 完整性 | `k1_proof` 四布尔全 `true`、`seq/prev_sha` 链完整、`token_fp`/`ts` 一致、字段无缺失 | **禁止** T7/T8；判"无法验证 K1 历史证明" |
+| E3 一致性 | 当前 `phase` 与 T6 事件的 `new_phase` 一致；`s5_failed` 由事件流恢复（不由 phase 推断） | **禁止** T7/T8 |
+
+任一项不通过 → **停留 `UNKNOWN`**，不推进 phase、不进入阶段 C、不写 success、maintenance 保持、写入关闭；允许（且仅允许）追加一条 `migration_note(code="evidence_unverified", detail=<失败项>)`，该 note 写入失败只落文件日志。
+
+**T6 事件写不进去时**：仍按 §2.1/§2.4 的既有规则处理——`set_phase` 返回 `False`，内存仍 `COMMIT_ATTEMPTED`，**不得**伪造 `UNKNOWN`、不得开放写入；随后可按 T6′ 的口径停 `COMMIT_ATTEMPTED` + 文件日志 + 保守恢复。
+
+**禁止项（写进设计约束，供实施阶段校验）**
+
+- 不得用"`phase == UNKNOWN`"推断 K1 历史成立；
+- 不得用"当前 S5 探测成功"推断历史上从未失败；
+- 不得用进程内变量、缓存或易失日志替代 E1–E3；
+- 不得为了让 β′ 通过而放宽 K1、S5、T7、T8 的既有条件，也不得补写、改写或删除历史事件。
+
+### 1.5 测试（MC13–MC14、MC25–MC26b、MC34–MC37、PH6–PH8）
 
 | # | 初始 | 步骤 | 预期 |
 | --- | --- | --- | --- |
+| MC34 | 路径 α：K1 成立、S5 失败、T6 事件写成功（`s5_failed_ever=true`） | **真实进程重启**（新进程、新连接、不复用内存） | β′ 由事件流恢复 `s5_failed=True`；E1–E3 通过后仍 **禁止 T7/T8**（T7′/T8′）；停留 `UNKNOWN`；无 success；写入关闭 |
+| MC35 | 路径 α：K1 成立、S5 成功、T6 事件写成功（`s5_failed_ever=false`） | **真实进程重启** | E1–E3 通过，`s5_failed=False`；继续按 T7/T8 完整条件判定（token 可见 → T7；均不可见 → T8）；条件不全则停留 `UNKNOWN` |
+| MC36 | 删除 / 篡改 / 伪造 T6 事件（分别构造：缺失、`k1_proof` 缺字段、`seq` 断链、`new_phase` 非 UNKNOWN、`token_fp` 不符） | 启动进入 β′ | E1/E2/E3 对应失败；**不推进 phase**、不进阶段 C、无 success、maintenance 保持、写入关闭；仅一条 `evidence_unverified` note（或文件日志） |
+| MC37 | MC34 之后，β′ 中 S5 探测成功 | 追加 `probe_ok` 事件后再次重启 | `s5_failed_ever` 仍为 `true`；`s5_failed=True` 依旧；T7′/T8′ 仍禁止；试图写"清除"语义事件被拒（`EvidenceMonotonicityViolation`） |
 | MC13 | COMMIT 抛异常，K1 成立，S5 成功 | 观察事件写入序 | DB 事件中**不存在**早于 S5 的 `→UNKNOWN`；`COMMIT_ATTEMPTED→UNKNOWN` 出现在 S5 之后；S5 前只有进程内标记 |
 | MC13b | 同上，但 K1 成立、S5 失败 | 观察 | 仍有 `COMMIT_ATTEMPTED→UNKNOWN`（S5 失败不影响 K1 闸门）；无 `→COMMITTED`/`→TX_ROLLED_BACK` |
 | MC14 | 同上，但 `close()` 失败（K1 不成立），探测亦失败 | 观察 | **无任何 DB 事件**；`migration-fault.log` 有记录；phase 停留 `COMMIT_ATTEMPTED`（T6′，未被伪装成 UNKNOWN）；进入保守恢复；写入保持关闭；无 success |
@@ -213,10 +270,11 @@ def set_phase(rec, new, reason):
 
 ### 2.2 `COMMITTED` 的四条件门禁
 
-进入阶段 C 前必须**同时**满足（四条件对两条路径相同，只是转换编号与失败去向不同）：
+进入阶段 C 前必须**同时**满足（四条件对三条入口相同，只是转换编号、证据来源与失败去向不同）：
 
+0. **入口证据成立**（仅 β′）：E1–E3 校验通过 ∧ `s5_failed` 由持久事件流恢复为 `False`（§1.4）；α 的 K1 证明来自本进程 §3.1 流程，β 的 `K1_β` 来自启动自证，均不需要重读历史事件；
 1. token 已确认可见（新连接只读查询成功）；
-2. 终止证据成立：路径 α 用 `K1`（§3.1）；路径 β 用 `K1_β`（§1.2 路径表）；
+2. 终止证据成立：路径 α 用 `K1`（§3.1）；路径 β 用 `K1_β`（§1.2 路径表）；路径 β′ 用 **T6 事件内的 `k1_proof`**（§1.4，历史证明，不由当前 phase 推断）；
 3. `K2` 成立（§3.2，即 S5 成功）；
 4. 对应的 `durable` 状态转换事件写入成功——路径 α 是 `T7`（`UNKNOWN → COMMITTED`），路径 β 是 `T4`（`COMMIT_ATTEMPTED → COMMITTED`），`set_phase` 返回 `True` 且 `rec.phase == COMMITTED`。
 
@@ -235,7 +293,10 @@ if rec.phase == Phase.COMMIT_ATTEMPTED:        # 只可能是路径 β
         enter_phase_c(rec)
 
 elif rec.phase == Phase.UNKNOWN:               # 路径 α（或 β′）
-    if not gate:
+    if is_beta_prime and not evidence_ok:      # E1–E3 未通过：不得判 T7/T8
+        append_reason(rec, "evidence_unverified", ...)   # 停留 UNKNOWN，不推进
+        handle_post_commit_failure(...)
+    elif not gate:
         append_reason(rec, "unknown_gate_incomplete", ...)   # 停留 UNKNOWN（T7′）
         handle_post_commit_failure(...)
     elif not set_phase(rec, Phase.COMMITTED, "token_visible_and_isolated"):
@@ -253,6 +314,7 @@ elif rec.phase == Phase.UNKNOWN:               # 路径 α（或 β′）
 | `UNKNOWN → COMMITTED` 失败后停留 UNKNOWN | 允许（不转换） | 停留即安全 | 走保守恢复 |
 | `UNKNOWN → COMMITTED` 但 **S5 曾失败** | **不允许** | S5 失败意味着"探测时刻存在写者"，token 可见也不足以证明外部世界已稳定 | 保持 `UNKNOWN`，继续保守恢复；不写 success、不开放写入 |
 | `UNKNOWN → TX_ROLLED_BACK` 但 **S5 曾失败** | **不允许**（T8′） | 同源理由：看不到 token 也不能证明外部写者已消失 | 保持 `UNKNOWN`，继续保守恢复 |
+| β′ 的 T7/T8 但 **E1–E3 未通过** | **不允许** | 缺历史 K1 证明或 `s5_failed` 不可恢复时，任何结论都无依据 | 停 `UNKNOWN`；一条 `evidence_unverified`；不进阶段 C |
 | `COMMIT_ATTEMPTED → UNKNOWN` 但 **K1 不成立** | **不允许**（T6′） | 原连接终止未被证明，写库会撞锁并被误读 | **不转换**，phase 停留 `COMMIT_ATTEMPTED`；只写文件日志；maintenance |
 | 二次补偿也失败（T6 事件失败） | — | **不推进任何状态** | 保持 maintenance；非数据库日志；`handle_post_commit_failure`；非零退出；**绝不开放写入** |
 | `COMMITTED → UNKNOWN` | **不允许** | 一旦 COMMITTED 已确认，后续失败属阶段 C，由 `handle_post_commit_failure` 处理，phase 不再回退（事件记 `migration_rollback`） | — |
@@ -279,7 +341,7 @@ elif rec.phase == Phase.UNKNOWN:               # 路径 α（或 β′）
 | PH10b | **路径 β**：T4 事件失败且 `migration_note` 也失败 | 注入两次失败 | 无 `migration_phase` 事件；内存停 `COMMIT_ATTEMPTED`；maintenance 保持；文件日志两条；无 success |
 | PH11 | 同 PH10 / PH10b | 检查写入入口与 success | 写入 503；`schema_migrations` 中该 mid 无 `success`；三重一致性断言全过（内存 phase、事件序列、`enter_phase_c` 次数三者一致） |
 | MC19 | COMMIT 抛异常，且 `rollback_for_migration()` 抛错（如 `SQLITE_BUSY`） | 注入回滚失败；统计 S4/S5 完成前的数据库写入 | S4（close）与 S5（探测）**完成之前**，`system_events` 写入次数 == **0**；回滚失败只出现在 `migration-fault.log`；`close()` 成功则 K1 成立 → S5 后可写 `→UNKNOWN`；`close()` 也失败则按 MC14 走 T6′（停 `COMMIT_ATTEMPTED`）；两种情形均无 success |
-| MC20 | `UNKNOWN` 态；K1 成立、S5 曾失败、新连接 token 可见 | 走 T7 判定 | **仍为 `UNKNOWN`**（T7′ 禁止）；不进入阶段 C；无 `→COMMITTED` 事件；无 success；保守恢复；写入关闭 |
+| MC20 | `UNKNOWN` 态；K1 成立、S5 曾失败、新连接 token 可见（同一进程走后 T7 判定；另设 β′ 变体：重启后由事件流恢复 `s5_failed=True`） | 走 T7 判定 | **仍为 `UNKNOWN`**（T7′ 禁止）；不进入阶段 C；无 `→COMMITTED` 事件；无 success；保守恢复；写入关闭。β′ 变体结论相同，且必须先有 E1–E3 通过 |
 
 ---
 
@@ -412,6 +474,8 @@ k1 = quarantined_ok and close_ok and conn_wrapper.is_closed and conn_wrapper.no_
 | **不通过的含义** | 有写者或探测本身失败；**不推断**原连接状态 |
 | **不得作为 K1 替代** | K1 为 False 时，即使 S5 通过也**不写 DB 事件、不推进 phase**（停留 `COMMIT_ATTEMPTED`） |
 | 关闭要求 | 探测连接必须显式 `close()`；未关闭视为探测失败（避免持锁） |
+| **失败历史的持久性** | 每次 S5 结果都必须随下一条 `migration_phase`/`migration_note` 事件持久化（`s5_result` + 单调 `s5_failed_ever`，§1.4）；失败历史跨进程、跨重启永久有效，后续成功**不得清除** |
+| **不得依赖易失状态** | `s5_failed` 不存放在进程内存或 `migration-fault.log` 中作为判定依据；β′ 只认事件流 |
 
 **两者关系**：K1 说"原连接不再持有事务"，S5 说"此刻没有别人在写"。**K1 ∧ S5 才是 K2**（§2.1 的两个条件），任一缺失都不得判定持久化状态。二者职责互不替代：K1 是**能否写入审计事件**的闸门，S5 只影响**能得出哪个结论**（`COMMITTED` / `TX_ROLLED_BACK` 都需要 S5 成功；`UNKNOWN` 只需 K1 成立）。
 
@@ -432,7 +496,8 @@ k1 = quarantined_ok and close_ok and conn_wrapper.is_closed and conn_wrapper.no_
 | --- | --- |
 | S5 通过后、文件替换前，又出现写者 | 替换前**再探测一次**（S5′），失败则 `abort_recovery`（退出码 4），备份不动 |
 | `close()` 失败（K1 不成立） | **不判 `UNKNOWN`**：phase 停留 `COMMIT_ATTEMPTED`，**不写任何 DB 事件**（S5 成功也不例外），只写 `migration-fault.log`，maintenance + 保守恢复 / 待人工（T6′） |
-| S5 失败但 K1 成立 | 仍 `UNKNOWN`（K2 不成立，故不得判 `COMMITTED`/`TX_ROLLED_BACK`）；**允许**写 `→UNKNOWN` 事件（原连接已关，不存在写锁）；随后保守恢复 |
+| S5 失败但 K1 成立 | 仍 `UNKNOWN`（K2 不成立，故不得判 `COMMITTED`/`TX_ROLLED_BACK`）；**允许**写 `→UNKNOWN` 事件并携带 `s5_result="failed"`、`s5_failed_ever=true`；随后保守恢复 |
+| 重启后 β′ 恢复 | 由 T6/后续事件流重建 `s5_failed`；E1–E3 通过且 `s5_failed=False` 才允许 T7/T8；任何历史失败 → 永久禁止 |
 | K1、S5 均失败 | 无 DB 事件、仅文件日志、phase 停留 `COMMIT_ATTEMPTED`、保守恢复 |
 | 他进程重新取得写锁且拒绝释放 | 不重试、不杀进程；`abort_recovery`，人工介入 |
 
@@ -448,7 +513,7 @@ k1 = quarantined_ok and close_ok and conn_wrapper.is_closed and conn_wrapper.no_
 | MC16 | 探测连接被外部持有写锁 | S5 失败，K1 成立 | 判 `UNKNOWN`；有 `→UNKNOWN` 事件；保守恢复；写入关闭 |
 | MC17 | S5 成功，随后注入他进程写锁 | 替换前 S5′ | 检出 → `abort_recovery`（码 4）；文件未替换；备份 sha256 不变 |
 | MC18 | token 不可见、对象不可见、S5 成立 | 判定：① 路径 β（`K1_β` 成立，前置 `COMMIT_ATTEMPTED`）② 路径 α/β′（`K1` 成立，前置 `UNKNOWN`） | ① 走 `T5 →TX_ROLLED_BACK`；② 走 `T8 →TX_ROLLED_BACK`；两者终止、无 success；不得交叉（β 不得走 T8） |
-| MC21 | K1 成立、**S5 曾失败**、token 不可见、对象不可见 | 判定 | **仍 `UNKNOWN`**（T8′ 禁止）；无 `→TX_ROLLED_BACK` 事件；不写 success；不开写入；保守恢复 |
+| MC21 | K1 成立、**S5 曾失败**、token 不可见、对象不可见（同进程 + β′ 重启变体各一） | 判定 | **仍 `UNKNOWN`**（T8′ 禁止）；无 `→TX_ROLLED_BACK` 事件；不写 success；不开写入；保守恢复；β′ 变体需 E1–E3 通过后方可判定且结论仍为禁止 |
 | MC22 | `conn.in_transaction` 属性读取抛异常 | 观察调用序列 | 仍执行 `quarantine()` 与 `close()`（close 尝试次数 = 1）；`had_tx=UNKNOWN` 只用于决定回滚尝试，**不进 K1**；若隔离与关闭均成功则 K1 可成立，否则 K1=False |
 | MC23 | `quarantine(conn)` 抛异常 | 观察 | 仍执行 `close()`（尝试次数 = 1）；**不调用** `conn.execute` / `rollback_for_migration()`；K1 = **False**；DB 写入次数 = 0；phase 保持 `COMMIT_ATTEMPTED`；maintenance = 开 |
 | MC24 | 属性读与 `quarantine` 均抛异常 | 观察 | 仍执行 `close()`（尝试次数 = 1）；K1 = **False**；DB 写入次数 = 0；phase 保持 `COMMIT_ATTEMPTED`；maintenance = 开；仅 `migration-fault.log`（两条记录、无 success） |
@@ -542,13 +607,16 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | COMMIT_ATTEMPTED | （无转换） | β 门禁不满足（`K1_β` 假 / S5 失败 / 事件失败） | **β** | `migration_note`（仅 `K1_β` 真时） | — | 停 `COMMIT_ATTEMPTED`；保守恢复（T4′） |
 | COMMIT_ATTEMPTED | UNKNOWN | COMMIT 抛异常 ∧ **K1 成立**（S5 成功或失败均可）（T6） | **α** | durable | **S5 后（唯一）** | 事件失败 → 非 DB 日志 + 恢复 |
 | COMMIT_ATTEMPTED | （无转换） | COMMIT 抛异常 ∧ **K1 不成立**（S5 成功或失败均可）（T6′） | **α** | **无**（`migration-fault.log`） | — | phase 停留 `COMMIT_ATTEMPTED`；maintenance + 保守恢复 / 待人工 |
-| UNKNOWN | COMMITTED | token 可见 **∧ K1 ∧ S5 成功 ∧ 事件成功**（四条件）（T7） | **α / β′** | durable | 查询后 | 任一不满足 → 停留 UNKNOWN + 恢复 |
+| UNKNOWN | COMMITTED | token 可见 **∧ K1 ∧ S5 成功 ∧ 事件成功**（四条件）（T7）；β′ 另需 E1–E3 ∧ `s5_failed=False` | **α / β′** | durable | 查询后（β′ 在 E1–E3 后） | 任一不满足 → 停留 UNKNOWN + 恢复 |
 | UNKNOWN | COMMITTED（S5 曾失败） | **禁止（T7′）** | **α / β′** | — | — | 保持 UNKNOWN；不写 success、不开写入 |
-| UNKNOWN | TX_ROLLED_BACK | token 不可见 **∧ 对象不可见 ∧ K1 ∧ S5 成功 ∧ 事件成功**（五条件）（T8） | **α / β′** | durable | 查询后 | 任一不满足 → 停留 UNKNOWN + 恢复 |
+| UNKNOWN | TX_ROLLED_BACK | token 不可见 **∧ 对象不可见 ∧ K1 ∧ S5 成功 ∧ 事件成功**（五条件）（T8）；β′ 另需 E1–E3 ∧ `s5_failed=False` | **α / β′** | durable | 查询后（β′ 在 E1–E3 后） | 任一不满足 → 停留 UNKNOWN + 恢复 |
 | UNKNOWN | TX_ROLLED_BACK（S5 曾失败） | **禁止（T8′）** | **α / β′** | — | — | 保持 UNKNOWN；不写 success、不开写入 |
 | UNKNOWN | UNKNOWN | — | 共用 | **禁止**（用 `append_reason`） | — | `IllegalTransition` |
+| UNKNOWN | （无转换） | β′ E1–E3 任一失败（证据缺失/不全/不符） | **β′** | `migration_note(evidence_unverified)` | E1–E3 后 | 停 `UNKNOWN`；不进阶段 C；无 success；写入关闭 |
 | COMMITTED | 任意 | — | 共用 | **禁止回退**（阶段 C 失败用 `migration_rollback` 事件） | — | — |
 
+> **β′ 的证据前置**：β′ 的 T7/T8 必须先通过 E1–E3（§1.4），`s5_failed` 只能由持久事件流恢复；`phase=UNKNOWN` 本身不构成任何证明。
+>
 > **路径不混用**：α 只出 `T6/T6′` 与 `T7/T7′/T8/T8′`；β 只出 `T4/T4′/T5`。表中「路径」列的 `α / β′` 表示两者共用同一转换定义（此时 phase 已是 `UNKNOWN`，终止证据按各自入口解释）。
 >
 > **S2 异常不产生任何转换**：属性读、隔离、回滚三段中的任一抛错，都只写 `migration-fault.log`；`phase` 仍为 `COMMIT_ATTEMPTED`。若隔离确认且关闭成功 → 走 T6 写 `→UNKNOWN`；否则走 T6′（无转换）。
@@ -627,6 +695,19 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | 记录初始化 | 报告需含"复制→单次→五项" |
 | 不依赖顺序 | FX4 + R10-A0 证明比较器无噪声 |
 
+### 6.6 六次修订 β′ 证据
+
+| 要求 | 落实 |
+| --- | --- |
+| T6 事件持久化足够证据 | §1.4 必填字段表（`migration_id`/`old_phase`/`new_phase`/`k1_proof`/`s5_result`/`s5_failed_ever`/`seq`/`prev_sha`/`ts`/`token_fp`） |
+| β′ 必须校验而非推断 | §1.4 E1–E3；§5 新增 `UNKNOWN →（无转换）` 行 |
+| 缺证据不得执行 T7/T8 | §1.4「禁止项」+ §2.2 β′ 分支 `evidence_ok` 前置 |
+| S5 失败历史永久可追溯 | 单调 `s5_failed_ever`；禁止清除语义；`EvidenceMonotonicityViolation` 拒写 |
+| 不得依赖易失标记 | §3.2「不得依赖易失状态」行；文件日志仅辅助 |
+| T6 事件写不进去 | 仍按 §2.1/§2.4：不伪造 UNKNOWN、不开放写入 |
+| 不放宽既有条件 | K1/S5/T7/T8 五/四条条件原样保留，β′ 只增加前置校验 |
+| 测试 | MC34–MC37（真实进程重启） |
+
 ---
 
 ## 7. 测试矩阵（增量）
@@ -643,7 +724,7 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | RC | 6 | 6 | — |
 | CF | 8 | 8 | — |
 | AU | 9 | 9 | — |
-| MC | 12 | **33** | +MC13–MC18；二次修订 +MC19–MC20；三次修订 +MC21、MC15b/15c/15d、MC13b；四次修订 +MC22–MC24；五次修订 +MC25/MC26/MC26b/MC27/MC27b |
+| MC | 12 | **37** | +MC13–MC18；二次修订 +MC19–MC20；三次修订 +MC21、MC15b/15c/15d、MC13b；四次修订 +MC22–MC24；五次修订 +MC25/MC26/MC26b/MC27/MC27b；六次修订 +MC34–MC37 |
 | CR | 5 | 5 | — |
 | FX | 3 | **4** | +FX4 |
 | PH | 5 | **13** | +PH6–PH11、PH9b、PH10b |
@@ -683,6 +764,8 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | S2 不中断关闭 | 三段独立 try + 兜底 close | §3.1 异常边界表 | MC22/MC23/MC24 |
 | 路径 α 不套 T4/T5 | S7 只调 T7/T8 | §1.2 路径归属表 | MC25 |
 | 路径 β 前置 phase | R1 读持久 `COMMIT_ATTEMPTED` | §5 `COMMIT_ATTEMPTED` 三行 | MC26/MC26b |
+| β′ 证据前置 | E1–E3 校验函数 + `evidence_ok` 前置 | §1.4 / §5 `UNKNOWN→（无转换）` | MC34/MC35/MC36 |
+| S5 失败历史不可清除 | 单调 `s5_failed_ever` + 拒写清除事件 | §1.4 历史失败标记 / §3.2 | MC37 |
 | 隔离失败仍关闭且 K1=False | `quarantined_ok=False` → `k1=False` | §3.1 判定表 | MC23/MC24 |
 | 关闭接口唯一 | `conn_wrapper.close()` 内部调底层 | §3.1 对象关系表 | MC27 |
 | `is_closed` 不得伪造 | 底层成功才置 True | §3.1 契约表 | MC27 |
@@ -740,7 +823,9 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | 15 | S2 属性读/隔离抛错中断流程 → 原连接未隔离、未关闭残留 | 三段独立异常边界 + 兜底 `close()` + K1 严格化 | MC22/MC23/MC24 |
 | 16 | 异常路径先落 UNKNOWN 后又套 T4/T5 → 前置状态不成立、状态表自相矛盾 | 路径 α/β 分离；编号按 phase 唯一决定 | MC25/MC26 |
 | 17 | 迁移流程直接调 `conn.close()` 而 `is_closed` 仍为 False → K1 误判 | 关闭接口统一走包装层；`is_closed` 只在底层成功后置位 | MC27/MC27b |
+| 18 | 重启后凭 `phase=UNKNOWN` 推断"上一进程 K1 成立" | β′ 必须 E1–E3 校验 T6 事件；缺证据即禁止 T7/T8 | MC34/MC36 |
+| 19 | S5 失败历史随进程消失 → 重启后误转 COMMITTED/ROLLED_BACK | `s5_failed_ever` 单调持久化，跨重启恢复；成功不得清除 | MC34/MC37 |
 
 ---
 
-**v1.10 到此结束。** 五次修订合计**未编写代码、未执行迁移、未修改数据库、未修改生产配置或生产数据**；五次修订累计只处理"五项 + 两项 + 三项 + S2 异常保护 + 路径与关闭接口一致性"的状态机与伪代码矛盾。**C11–C20 全部未确认，C12 仍未被本轮视为已批准。** 文档交回总体设计最终审查；未获批准前不提交 P-1 实施计划、不进入任何实施阶段。
+**v1.10 到此结束。** 六次修订合计**未编写代码、未执行迁移、未修改数据库、未修改生产配置或生产数据**；六次修订累计只处理"五项 + 两项 + 三项 + S2 异常保护 + 路径与关闭接口一致性 + β′ 跨重启证据"的状态机与伪代码矛盾。**C11–C20 全部未确认，C12 仍未被本轮视为已批准。** 文档交回总体设计最终审查；未获批准前不提交 P-1 实施计划、不进入任何实施阶段。
