@@ -2001,9 +2001,9 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 **验收修正（P-1.7 复审后追加，架构不变）**：
 
 1. **连接关闭逐条确认**：`close_all_connections_report()` 返回每条连接的关闭结果；关闭失败或未关闭的连接保留在登记表并计入 `remaining`，任一失败即中止导入（`connections_not_closed`），维护态与写封锁保持、不替换数据库；本进程自身对 `.db`/`-wal`/`-shm` 的句柄由 `self_handles_of()` 一并复核，不能确认全部关闭时不得替换。
-2. **元信息强制校验**：正式备份必须 `.db` + 同名 `.json` 成对；必备字段齐全、JSON 可解析、`format=2`、`db_bytes`/`sha256`/`structure_hash`/`integrity_check` 与实文件实配；`verify` 与 `import` 用同一严格规则，无效备份不进入维护态、不改目标库。
+2. **元信息强制校验**：正式备份必须 `.db` + 同名 `.json` 成对；必备字段齐全、JSON 可解析、`format=2`、`db_bytes`/`sha256`/`structure_hash`/`integrity_check` 与实文件实配；`tables`/`structure_profile`/`schema_version`/`tasks`/`key_digests` 还必须与库内重算结果逐项一致；`verify` 与 `import` 用同一严格规则，无效备份不进入维护态、不改目标库。
 3. **备份文件名唯一**：时间戳精确到秒，故文件名追加 6 位随机后缀并以 `os.link` 排他落名；同秒与并发导出均不覆盖，程序不删旧备份。
-4. **preimport 原库完整性**：原库副本不复制主库文件，改用在线备份 API 生成（包含尚未 checkpoint 的已提交 WAL 页），生成后只读校验并与当前库逐表计数比对；副本保留、不自动删除。
+4. **preimport 原库完整性**：原库副本不复制主库文件，改用在线备份 API 生成（包含尚未 checkpoint 的已提交 WAL 页），生成后只读校验，并与当前库的**活库读法**（`_probe_file(immutable=False)`，`mode=rw` + `PRAGMA query_only=1`）逐表计数比对；不得用默认 `immutable=True` 的冻结读法（会漏 WAL 已提交页而误判）。副本保留、不自动删除。
 5. **活库读取口径**：纯 `mode=ro` 打开 WAL 库可能读到旧快照（实测丢已提交行），活库一律 `mode=rw` + `PRAGMA query_only=1`，冻结备份文件才用 `mode=ro&immutable=1`。
 
 **验收**（详见 P-1 实施计划 §2.1/§2.3/§2.4/§5）：导出单文件与元信息、运行期导出一致性、完整性校验、正常导入、无效备份拒绝（含元信息缺失/损坏/缺字段）、导入期写封锁、连接关闭失败中止、本进程句柄拦截、同秒/并发导出不覆盖、preimport 含 WAL 已提交数据、导入失败现场、WAL/SHM 处理、迁移测试零回归。
