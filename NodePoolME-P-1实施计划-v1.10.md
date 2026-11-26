@@ -297,7 +297,7 @@ BACKUP_DIR/nodepool-YYYYMMDD-HHMMSS-<label>-<6位hex>.json  # 元信息（与 .d
 
 4. 发布顺序：`.tmp-<nonce>.db` 写入 → `fsync` → **独立只读连接**上 `integrity_check` + 表集合 + 结构摘要 → 全部通过才落名 → 目录 `fsync` → 写元信息（含 sha256）→ 目录 `fsync`。校验不过即删除临时文件，**不产生半成品文件**。
    落名用 `os.link(tmp, candidate)` 的**排他语义**：候选名自带 6 位随机后缀，`FileExistsError` 就换名重试（上限 64 次），**绝不 `os.replace` 覆盖已有备份**；同秒连续导出、并发导出都必须各自得到唯一文件名；程序不删任何旧备份。
-5. **元信息强制成对**：`.db` 与同名 `.json` 缺一即无效；`REQUIRED_META_FIELDS`（format=2、created_at、app_version、sqlite_version、db_bytes、sha256、integrity_check、structure_hash、structure_profile、schema_version、tasks、tables、key_digests）缺任一字段、JSON 不可解析、`format` 非 2、`db_bytes`/`sha256`/`structure_hash`/`integrity_check` 与实文件不匹配，一律 `verify` 失败。`verify` 与 `import` 调用**同一函数**、同一严格规则；无效备份不得进入维护态、不得改目标库。
+5. **元信息强制成对且内容实配**：`.db` 与同名 `.json` 缺一即无效；`REQUIRED_META_FIELDS`（format=2、created_at、app_version、sqlite_version、db_bytes、sha256、integrity_check、structure_hash、structure_profile、schema_version、tasks、tables、key_digests）缺任一字段、JSON 不可解析、`format` 非 2、`db_bytes`/`sha256`/`structure_hash`/`integrity_check` 与实文件不匹配，一律 `verify` 失败。除存在性外，还要把可从数据库重算的 `tables`/`structure_profile`/`schema_version`/`tasks`/`key_digests` 与备份库实际结果**逐项比对**（`META_CONTENT_FIELDS`），任一不等即 `meta_<field>_mismatch`。`verify` 与 `import` 调用**同一函数**、同一严格规则；无效备份不得进入维护态、不得改目标库。
 5. **不做滚动清理**：备份由用户保管，程序不自动删除、不生成 `nodepool-latest.db` 指针、不设 `pre-migrate`/`pre-restore` 保护标记。
 6. CLI：`python -m backend.database.cli backup [--out DIR] [--label manual]`；`/api/system/backup` 与 `/download` 复用同一函数（`ok/file/size/sha256/integrity_check`）。
 
@@ -550,7 +550,7 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 4. **排空**：`drain(rounds=2, min_interval=10.0)`；未通过 ⇒ 中止，维护态与封锁保持。
 5. **关闭全部连接并逐条确认**：`db.close_all_connections_report()` 返回 `{closed, failed:[{label,error}], remaining, ok}`；**只有关闭成功**的连接才从登记表移除，关闭失败/未关闭的一律留在表内并计入 `remaining`；线程本地 `conn`/`ro` 同规则处理。任一条 `failed`/`remaining` 非空或 `ok=False` ⇒ `connections_not_closed`，**中止导入**，维护态与写封锁保持，不替换任何文件。
 6. **句柄复核（含本进程）**：`holders_of(target)` 扫 `/proc/*/fd` 找第三方持有；`self_handles_of(target)` 扫 `/proc/self/fd` 复核本进程自身对目标库与 `-wal/-shm` 的句柄；任一命中 ⇒ `import_handles_present` / `import_self_handles_present`，中止且不替换。不能确认"全部关闭"时不得替换数据库。
-7. **WAL/SHM 与替换**：先用 SQLite 在线备份 API 生成原库副本 `*.preimport-<stamp>.db`（不是 `copyfile` 主库：主库可能缺少尚未 checkpoint 的已提交 WAL 页）；副本用 `_probe_file` 只读校验 + 与当前库逐表计数比对，不等即 `preimport_incomplete` 且不动替换；副本完好后才把 `-wal`/`-shm` 改名隔离（不删除）；备份文件复制到同卷 `.import-<nonce>.db` + fsync + 复核；`os.replace` + 目录 fsync。preimport 副本保留，不自动删除。
+7. **WAL/SHM 与替换**：先用 SQLite 在线备份 API 生成原库副本 `*.preimport-<stamp>.db`（不是 `copyfile` 主库：主库可能缺少尚未 checkpoint 的已提交 WAL 页）；副本用 `_probe_file(immutable=True)` 校验 + 与当前库**活库读法** `_probe_file(target, immutable=False)`（`mode=rw` + `PRAGMA query_only=1`，能看到 WAL 未 checkpoint 页）逐表计数比对，不等即 `preimport_incomplete` 且不动替换；副本完好后才把 `-wal`/`-shm` 改名隔离（不删除）；备份文件复制到同卷 `.import-<nonce>.db` + fsync + 复核；`os.replace` + 目录 fsync。preimport 副本保留，不自动删除。
 8. **替换后复核**：独立只读连接 `integrity_check` → 表集合 → 结构摘要 → 逐表计数与**源备份文件**比对；不一致即复原并报 `import_verify_failed`。
 9. **收尾**：成功 ⇒ 清理空的 `-wal/-shm`、保留 `*.preimport-*.db` 供人工确认、删 `maintenance.json` + 目录 fsync + 复核 INACTIVE + 解除写封锁；失败 ⇒ 维护态与写封锁保持，报 `import_failed` / `import_rolled_back` / `import_failed_leftover`。
 10. 全程禁止：`reset_connection()` 后 `shutil.copy2` 覆盖（旧实现做法）、在仍有连接/句柄时删 `-wal`、把"上传文件"直接当恢复源、自动多级回退或恢复子进程。
@@ -625,7 +625,9 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 | PBT-13 | 元信息严格校验 | 缺 `.json` / JSON 损坏 / 缺必备字段 三态均拒绝，且不进入维护态、目标库零改动 |
 | PBT-14 | 同秒导出不覆盖 | 固定时间戳连导 3 次，得到 3 个不同文件名、3 份可校验备份，旧文件 sha 不变 |
 | PBT-15 | 并发导出不覆盖 | 6 线程同时导出，文件名互不相同、全部可校验、无失败 |
-| PBT-16 | preimport 完整性 | 子进程写入后 `os._exit(0)` 造未 checkpoint 的已提交 WAL 页；导入后 `*.preimport-<stamp>.db` 的逐表计数等于含 WAL 的真实库且含该行，副本保留 |
+| PBT-16 | preimport 完整性 | 子进程写入后保持连接（或 `os._exit(0)`）造未 checkpoint 的已提交 WAL 页；`immutable=True` 读法看不到该行、`immutable=False` 活库读法看到；preimport 副本逐表计数等于活库且含该行，副本保留 |
+| PBT-17 | 活库读法钉死 | 导入路径对目标库的 preimport 复核必须调用 `_probe_file(immutable=False)`（spy 断言） |
+| PBT-18 | 元信息内容篡改 | 分别篡改 `tables`/`structure_profile`/`schema_version`/`tasks`/`key_digests` ⇒ `verify` 报对应 `meta_*_mismatch`；`import` 退出码 2、未进维护态、目标库零改动 |
 
 判据统一口径：**每一项必须给出"命令 + 期望输出 + 不通过时的处置"**；"跑通了"不算通过，必须贴输出。
 
