@@ -1071,7 +1071,6 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 | ABSENT | ABSENT | 仅基线 | `INACTIVE` | `db_clean_no_maint` |
 | ABSENT | ABSENT | 基线+success | `INACTIVE` | `db_migrated_no_maint` |
 | PRESENT 且 `maintenance=false`、字段合法 | COMMITTED | 基线+success | `INACTIVE` | `maint_released_db_success` |
-| PRESENT 且 `maintenance=true` | 任意已知 | 任意 | `RECOVERY_REQUIRED` | `stale_maintenance`（锁已取得，上一进程已终止） |
 | 任意 | PREPARED | 仅基线 | `RECOVERY_REQUIRED` | `interrupted_before_tx` |
 | 任意 | TX_OPEN | 仅基线 | `RECOVERY_REQUIRED` | `interrupted_in_tx` |
 | 任意 | TX_ROLLED_BACK | 仅基线 | `RECOVERY_REQUIRED` | `rolled_back_without_failed_row` |
@@ -1081,7 +1080,7 @@ MAINT_FILE = STATE_DIR / "maintenance.json"
 | 任意 | COMMIT_ATTEMPTED/COMMITTED | 基线+success | `RECOVERY_REQUIRED` | `success_pending_release` |
 | 任意 | UNKNOWN | 任意 | `RECOVERY_REQUIRED` | `outcome_unknown` |
 
-**优先级**：先判维护文件损坏/不可读/非法（F-3），再判 `maintenance=true`（一律 `stale_maintenance`，不再看 phase/DB），其余按上表自上而下首条命中；都不会继续向下 fall-through。
+**优先级**：先判维护文件损坏/不可读/非法（F-3）；再按上表具体组合自上而下首条命中；`maintenance=true` 但未被任何具体组合命中时，才判 `RECOVERY_REQUIRED(stale_maintenance)`（锁已取得，上一进程已终止）。`maintenance=true` 永远不得落到 `INACTIVE`。
 
 **兜底规则（任一命中即 `RECOVERY_REQUIRED`，禁止自动解封）**：
 

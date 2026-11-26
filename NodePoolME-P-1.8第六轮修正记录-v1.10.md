@@ -40,7 +40,7 @@
 | F-5 | 查询失败、表存在性/`migration_id/version/seq` 冲突、WAL 不可信、连接状态不一致 | `RECOVERY_REQUIRED` / `probe_unverifiable` |
 | F-6 | `flock` 不可用（ENOLCK/EOPNOTSUPP） | 启动失败 / `migration_lock_unsupported` |
 
-优先级：维护文件损坏/非法 → `maintenance=true`（`stale_maintenance`，一律恢复态）→ 合法配对表自上而下首条；异常直接转 `RECOVERY_REQUIRED`，不得落到 `INACTIVE`。
+优先级：维护文件损坏/非法 → 合法配对表自上而下首条 → `maintenance=true` 但未被具体组合命中时 `stale_maintenance`；异常直接转 `RECOVERY_REQUIRED`，不得落到 `INACTIVE`。
 
 ## 4. D2 入口闭环（选择 B）
 

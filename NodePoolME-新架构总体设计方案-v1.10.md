@@ -2118,13 +2118,14 @@ P-1.8 不提供应用内迁移接口；同一 `STATE_DIR` 单应用实例，迁�
 | 维护文件 ABSENT + 仅基线 | `INACTIVE`（`db_clean_no_maint`） |
 | 维护文件 ABSENT + 基线+success | `INACTIVE`（`db_migrated_no_maint`） |
 | `maintenance=false` 且字段合法 + phase COMMITTED + 基线+success | `INACTIVE`（`maint_released_db_success`） |
-| `maintenance=true`（锁已取得） | `RECOVERY_REQUIRED`（`stale_maintenance`） |
 | phase+DB 为 PREPARED/仅基线、TX_OPEN/仅基线、TX_ROLLED_BACK/仅基线、TX_OPEN 或 COMMIT_ATTEMPTED/基线+failed、TX_ROLLED_BACK/基线+failed、COMMIT_ATTEMPTED/基线+running、COMMIT_ATTEMPTED 或 COMMITTED/基线+success、UNKNOWN/任意 | `RECOVERY_REQUIRED`（对应码同计划 §8.7.1） |
+| `maintenance=true` 且未被上述具体组合命中 | `RECOVERY_REQUIRED`（`stale_maintenance`，锁已取得） |
+
 | 其余任何组合 | 命中 F-1…F-6，`RECOVERY_REQUIRED` 或 `migration_lock_unsupported` |
 
 运行中的 ACTIVE 仅存在于 CLI 迁移会话（应用已停），由 D2 入口闭环保持封锁；应用启动不产生合法 ACTIVE。
 
-**只读恢复判定与 init_db 分离**：探测连接使用 `mode=rw` 仅为读取 WAL 未 checkpoint 页，随后 `PRAGMA query_only=1`，DB 内容零写入；探测连接不得执行任何 DDL/DML，不得调用 `init_db()`/`ensure_schema_table_transactional()`/`record_baseline()`；业务初始化只在分类 `INACTIVE` 后执行。`PRESENT maintenance=true` 且锁已取得 ⇒ `stale_maintenance` → `RECOVERY_REQUIRED`，不得当成运行中的 ACTIVE。
+**只读恢复判定与 init_db 分离**：探测连接使用 `mode=rw` 仅为读取 WAL 未 checkpoint 页，随后 `PRAGMA query_only=1`，DB 内容零写入；探测连接不得执行任何 DDL/DML，不得调用 `init_db()`/`ensure_schema_table_transactional()`/`record_baseline()`；业务初始化只在分类 `INACTIVE` 后执行。`maintenance=true` 未被具体组合命中时判 `stale_maintenance` → `RECOVERY_REQUIRED`，不得当成运行中的 ACTIVE，也不得落到 `INACTIVE`。
 
 
 **前置条件**：P-1.7 已验收（`a62aeb2`）；P-1.3–P-1.6 回归全绿；独立 bridge 网络、独立端口 8089、独立 bind 目录与 `STATE_DIR`、禁用自动重启；测试库为离线副本或同构合成库，禁止挂载生产目录；仅在测试目录验证 `os.replace`/`fsync`；记录镜像 digest 与 `config.VERSION`。
