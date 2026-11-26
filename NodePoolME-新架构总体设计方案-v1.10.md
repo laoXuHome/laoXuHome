@@ -15,6 +15,8 @@
 
 **八次修订（Evidence Integrity Closure）**：① `token_fp` 改为 `system_events` 独立列并接入真实 `INSERT` 与 β′ 校验；② `tx_local` 拆到 `migration_tx_notes`，消除与 DDL 的 3 列 INSERT 冲突；③ `write_event` 在 `BEGIN IMMEDIATE` 内做 C1–C8 全链校验后再追加；④ 路径 α/β′ 均在 `set_phase` 前执行 `hist_gate`（`s5_failed_ever` 永久禁止 T7/T8）。改动点见 §0.7。
 
+**十三次修订（Final Consistency Closure）**：① 全篇统一 `A→SUCCESS` / `B→REJECTED` / `C→HALTED` / `L` 仅 tx_local，清除 §1.4、§2.1、§2.5 等处的裸 `False` 与"C 归 REJECTED"残留；② `maintenance` 改为独立 `maintenance.json`（原子 rename + fsync + `verify_maintenance` 回读），未确认即 `fatal_exit`；`halt_tail` 以显式检查取代 `assert`。改动点见 §0.10。
+
 **十二次修订（Final Halt Semantics Fix）**：① `write_event` 改为返回 `WriteOutcome`（A/B/C/`LOCAL`），C 类在 `set_phase` 只映射为 `HALTED`、不重复 halt，`migration_note` 的 C 类经 `note_or_stop` 走 `halt_tail`；② `halt_migration` 三个保护动作独立异常边界，封锁须回读确认，未确认即 `fatal_lockdown` + `fatal_exit`。改动点见 §0.10。
 
 **十一次修订（Final Halt Propagation Fix）**：`set_phase()` 改为三态返回 `SUCCESS`/`REJECTED`/`HALTED`，`HALTED` 只能经 `halt_tail` 上行（零数据库写入、maintenance 保持）；`emit_event`/`append_reason` 在 `rec.halted` 时拒写。改动点见 §0.10。
@@ -72,7 +74,7 @@
 
 | 项 | 位置 | 改动 |
 | --- | --- | --- |
-| T6 证据接入写入路径 | §2.1 `write_event` / `set_phase` 伪代码、字段来源表、`system_events` DDL | `k1_proof` 只读 `rec.k1_state`；`s5_result` 取实际结果；`s5_failed_ever = 历史 OR 本次`；`seq`/`prev_sha` 事务内生成；证据不全 → 返回 `False`、不写 T6 |
+| T6 证据接入写入路径 | §2.1 `write_event` / `set_phase` 伪代码、字段来源表、`system_events` DDL | `k1_proof` 只读 `rec.k1_state`；`s5_result` 取实际结果；`s5_failed_ever = 历史 OR 本次`；`seq`/`prev_sha` 事务内生成；证据不全 → `PhaseResult.REJECTED`（INSERT 前拒绝）、不写 T6 |
 | 后续事件统一接入 | §1.2 `append_reason` 伪代码 + 强制约束表 | 全部走 `write_event`；带 `migration_id`/`s5_failed_ever`/`seq`/`prev_sha`；单调性违反拒写 |
 | 哈希链与原子性 | §2.1 规范化规则 + 原子性说明 + DDL 两个 UNIQUE | `seq` 从 1、连续 +1、`UNIQUE(migration_id,seq)`；`prev_sha` 首事件 `GENESIS(mid)`；`BEGIN IMMEDIATE` 事务边界；失败不推进 phase、不提交内存标记；断链不重建 |
 | note 三态 | §1.4 三分支表 | 链完整才写 note；链断裂只写文件日志；单调性不满足拒写 |
@@ -117,6 +119,9 @@
 | 十二次 P0-1 C 类不降级 | §2.1 `WriteOutcome` + `write_event`/`settle_uncertain`/`emit_event`/`append_reason` 返回类型 + `note_or_stop`；§2.2 分支改写 | A/B/C 全链保留；C → `HALTED`（只映射、不重复 halt）；note 的 C 类走 `halt_tail` |
 | 十二次 P0-2 halt 故障安全 | §2.1 `halt_migration` 重写 + `guard_log` + 三道拒写机制表 + `fatal_exit` | 三动作独立保护、封锁须回读确认、未确认即致命非零退出、全程不写库不抛普通异常 |
 | 测试 | §2.5 MC61–MC62、§7 计数 60→62 | 真实 DB + 计数断言 |
+| 十三次 P0-1 语义统一 | §1.4 T6 三分支、§2.1 三态表/语义对照表/映射口径、§2.2 表、§2.3 表、MC43/49/59 | `A→SUCCESS`、`B→REJECTED`、`C→HALTED`、`L` 仅 tx_local；裸 `False` 清零 |
+| 十三次 P0-2 maintenance 一致性 | §2.1 halt 重写 + `verify_maintenance` + 持久化契约表；§2.2 `halt_tail` 显式检查 | 未确认不返回正常 HALTED；`fatal_exit` 非零退出；不用 `assert` |
+| 测试 | §2.5 MC63–MC64、MC62 收紧、§7 计数 62→64 | 读文件回读 + DB 零写 + 退出码断言 |
 
 ### 0.3 四次修订改动点（S2 异常保护）
 
@@ -301,7 +306,7 @@ def note_or_stop(rec, code, detail):
 
 任何情况下都**不得**为写入 note 而补建、重算、覆盖或删除历史事件；链一旦断，只能人工介入。
 
-**T6 事件写不进去时**：仍按 §2.1/§2.4 的既有规则处理——`set_phase` 返回 `REJECTED`，内存仍 `COMMIT_ATTEMPTED`，**不得**伪造 `UNKNOWN`、不得开放写入；随后可按 T6′ 的口径停 `COMMIT_ATTEMPTED` + 文件日志 + 保守恢复。
+**T6 事件写不进去时**（三种必须分开，不得合成一句）：① 证据不合格、未发出 `INSERT` → `PhaseResult.REJECTED`，内存仍 `COMMIT_ATTEMPTED`，按 T6′ 停 `COMMIT_ATTEMPTED` + 文件日志 + 保守恢复；② `write_event` 判定 B（确认未提交）→ `REJECTED`，处理同①；③ 判定 C（无法确认）→ `PhaseResult.HALTED`，maintenance 保持、零后续数据库写入、等人工。三种情形**均不得**伪造 `UNKNOWN`、不得开放写入。
 
 **禁止项（写进设计约束，供实施阶段校验）**
 
@@ -374,7 +379,7 @@ CREATE TABLE migration_tx_notes (
 | 后端 | 连接 | 事务边界 | 落表 | 失败语义 | 是否进入证据链 |
 | --- | --- | --- | --- | --- | --- |
 | `tx_local` | `rec.conn`（迁移原连接） | 迁移事务内 | `migration_tx_notes` | 写失败只记日志；**phase 仍推进**（非权威） | **否** |
-| `durable` | `audit_conn()`（独立审计连接） | 独立事务 `BEGIN IMMEDIATE … COMMIT` | `system_events` | 写失败 → 返回 `False`，**phase 不推进** | **是** |
+| `durable` | `audit_conn()`（独立审计连接） | 独立事务 `BEGIN IMMEDIATE … COMMIT` | `system_events` | 返回 `WriteOutcome`（A/B/C）；B → `REJECTED`、C → `HALTED`，**phase 不推进** | **是** |
 
 **字段来源（不接受调用方随意传入）**
 
@@ -548,6 +553,17 @@ def reconcile_event(exp):
 | **B 确认未提交** | 链为空且 `seq=1`，或链尾 `seq < exp.seq`（且链本身通过 C1–C8） | 返回 `WriteOutcome.ABSENT`；`set_phase` 返回 `REJECTED` | **不推进** | **不更新**（不提前提交） | 禁止（不补写） |
 | **C 无法确认** | 只读重查不可用 / 目标行存在但字段不一致 / 链断裂 / 目标行后仍有事件 / 结果自相矛盾 | 内部 `halt_migration(rec, ...)` **一次**（幂等），返回 `WriteOutcome.UNRESOLVED`；`set_phase` **只做映射** → `HALTED`，不再调 halt | 保持原值 | 保持原值 | **禁止**；等人工 |
 
+**`WriteOutcome` → `PhaseResult` 唯一映射（全篇只此一张表）**
+
+| `WriteOutcome` | 含义 | `set_phase` 产出 | 上游语义 |
+| --- | --- | --- | --- |
+| `COMMITTED`（A） | 确认已提交 | `SUCCESS`（前提：`commit_phase_in_memory` 成功；其异常则 `HALTED`） | 进阶段 C |
+| `ABSENT`（B） | 确认未写入 | `REJECTED` | 原失败路径，可写 `migration_note` |
+| `UNRESOLVED`（C） | 无法确认（`halt_migration` 已在内层执行一次） | `HALTED`（只映射，不再调用 halt） | `halt_tail`，零数据库写入 |
+| `LOCAL`（L） | tx_local 提示 | 不产生 `PhaseResult`（tx_local 分支直接 `commit_phase_in_memory`） | **禁止**进入任何 durable 判断 |
+
+> T6 证据不合格属 **INSERT 前拒绝**，映射为 `REJECTED`，与 B 同属"确认未提交"范畴；C 是"提交结果不确定"，两者不得混用（MC43 与 MC61 分别覆盖）。
+
 **内存与持久状态的一致性（硬规则）**
 
 1. `rec.s5_failed_ever` **只能**在 `COMMIT` 正常返回或 A 路径确认后更新；B/C 路径一律不动。
@@ -651,64 +667,78 @@ class PhaseResult(Enum):
     HALTED   = "halted"     # 事件已确认提交，但内存落地异常：已进 maintenance，禁止任何后续数据库写入
 
 def halt_migration(rec, code, detail):
-    """故障安全：每个保护动作独立异常边界；不抛普通异常；不写数据库；幂等。"""
+    """故障安全 + 前置确认：只有 maintenance 与写入封锁**都回读确认**才正常返回。
+    不写业务库、不追加 note、不抛普通异常、幂等。"""
     if getattr(rec, "halt_done", False):
-        return                                     # 只执行一次（MC60/MC61 断言）
-    rec.halt_done   = True
-    rec.halted      = True                         # 内存闸（第一道）
-    rec.exit_code   = EXIT_FATAL                   # 先置退出码，不依赖后续动作
+        return                                     # 只执行一次
+    rec.halt_done  = True
+    rec.halted     = True                          # 内存闸（第一道）
+    rec.exit_code  = EXIT_FATAL                    # 先置，不依赖后续动作
     faults = []
 
-    # ① maintenance（独立保护）
+    # ① maintenance 持久标记（独立文件，不经业务库；见"maintenance 持久化契约"）
+    maint_ok = False
     try:
-        set_maintenance(rec)
-        rec.maintenance = True
+        set_maintenance(rec)                       # 原子写 + fsync + dir fsync
     except Exception as e:
         faults.append(("set_maintenance", repr(e)))
         guard_log("halt_maintenance_failed", dict(err=e, code=code))
+    try:
+        maint_ok = verify_maintenance(rec)         # 回读：文件存在 ∧ JSON 字段匹配 ∧ 内容一致
+    except Exception as e:
+        faults.append(("verify_maintenance", repr(e)))
+        guard_log("halt_maintenance_unverified", dict(err=e, code=code))
+    rec.maintenance_ok = maint_ok                  # 未确认即 False，绝不置 True 充数
 
-    # ② 业务写入封锁（独立保护；失败即进入致命路径，绝不返回正常 HALTED）
+    # ② 业务写入封锁（独立；不因①失败而跳过）
     lock_ok = False
     try:
-        block_business_writes(rec)                 # 进程级全局写闸 + 关写连接 + PRAGMA query_only
-        lock_ok = confirm_writes_blocked(rec)      # 必须"确认"，不能只"调用过"
+        block_business_writes(rec)                 # 全局写闸 + 关写句柄 + 业务连接只读
+        lock_ok = confirm_writes_blocked(rec)      # 必须回读确认
     except Exception as e:
         faults.append(("block_business_writes", repr(e)))
         guard_log("halt_write_lock_failed", dict(err=e, code=code))
-    if not lock_ok:
-        try:
-            fatal_lockdown(rec)                    # 最后手段：强制只读/摘除写句柄/停服务
-        except Exception as e:
-            faults.append(("fatal_lockdown", repr(e)))
-            guard_log("halt_fatal_lockdown_failed", dict(err=e))
-        fault_log("writes_block_unconfirmed", dict(code=code, faults=faults, detail=detail))
-        fatal_exit(rec, "writes_block_unconfirmed")   # 非零退出；不返回任何"正常"结果
+    rec.writes_blocked = lock_ok
 
-    # ③ 非数据库日志（独立保护；自身失败降级到 stderr，仍不抛出）
+    # ③ 非数据库日志（独立；自身失败再降级 stderr）
     try:
         non_db_log(code, detail)
     except Exception as e:
         faults.append(("non_db_log", repr(e)))
         guard_log("halt_log_failed", dict(err=e, code=code))
 
-    # ④ 全程收口：任何未预期异常都不得冒泡成"事件写入失败"
+    # ④ 收口：任一前置未确认 ⇒ 致命路径（不返回"正常 HALTED"）
+    if not lock_ok:
+        try:
+            fatal_lockdown(rec)                    # 最后手段：强制只读/摘写句柄/停服务
+        except Exception as e:
+            faults.append(("fatal_lockdown", repr(e)))
+            guard_log("halt_fatal_lockdown_failed", dict(err=e))
+        fault_log("writes_block_unconfirmed", dict(code=code, faults=faults, detail=detail))
+        fatal_exit(rec, "writes_block_unconfirmed")
+    if not maint_ok:
+        fault_log("maintenance_unconfirmed", dict(code=code, faults=faults))
+        fatal_exit(rec, "maintenance_unconfirmed")   # 拒写已确认，但重启后无法识别维护态
+
     try:
         fault_log("halt_completed_with_faults" if faults else "halt_completed",
                   dict(code=code, faults=faults))
     except Exception:
         pass
     rec.halt_faults = faults
-    return                                     # 不抛出；上层通过 PhaseResult.HALTED 感知
+    return                                         # 正常返回的前提：maint_ok ∧ lock_ok
 
-def guard_log(code, detail):
-    """日志的日志：三层降级，永不抛出。"""
+def verify_maintenance(rec) -> bool:
+    """回读校验；任何不一致都返回 False，绝不"调用过就算成功"。"""
     try:
-        non_db_log(code, detail)
+        blob = json.loads(Path(MAINT_FILE).read_text(encoding="utf-8"))
+        return (blob.get("maintenance") is True
+                and blob.get("migration_id") == rec.migration_id
+                and blob.get("phase") == rec.phase.name
+                and blob.get("since") and blob.get("nonce") == rec.maint_nonce)
     except Exception:
-        try:
-            sys.stderr.write("%s %s\n" % (code, detail))
-        except Exception:
-            pass
+        return False
+
 def commit_phase_in_memory(rec, new):
     """事件确认后的唯一 phase 落地动作。返回 PhaseResult，不再返回裸 bool。"""
     try:
@@ -755,6 +785,19 @@ def set_phase(rec, new, reason) -> PhaseResult:
     return commit_phase_in_memory(rec, new)
 ```
 
+**maintenance 持久化契约（独立于业务数据库，本轮定稿）**
+
+| 项 | 规定 |
+| --- | --- |
+| 存放位置 | `MAINT_FILE = <STATE_DIR>/maintenance.json`；`STATE_DIR` 是部署目录下的状态目录，**与业务 SQLite 库分离**（同卷不同文件，不建表、不写 `system_events`、不进 `migration_tx_notes`） |
+| 内容 | `{"maintenance":true,"migration_id":MID,"phase":<当前phase>,"since":<UTC毫秒>,"nonce":<每次写入随机串>,"reason":<code>,"pid":<pid>}` |
+| 写入方式（原子） | 写 `maintenance.json.tmp.<nonce>` → `flush` + `os.fsync` → `os.replace` 到目标名（同目录 rename，POSIX 原子）→ `fsync(STATE_DIR)`。**不原地改写目标文件**，避免半写状态 |
+| 回读验证 | `verify_maintenance()`：重新读取目标文件 → JSON 解析成功 ∧ `maintenance is True` ∧ `migration_id == MID` ∧ `phase == rec.phase.name` ∧ `since` 非空 ∧ `nonce == rec.maint_nonce`。**只认回读结果，不认"调用过 `set_maintenance` 就算成功"** |
+| 幂等 / 重复写 | 已存在且内容匹配则跳过写；不一致则重写；同一 `nonce` 保证可判定"这一份是否是我写的" |
+| 与写入禁令的关系 | maintenance 不经业务库，因此 halt 期间"禁止数据库写入"与"持久化 maintenance"不冲突；这也是唯一允许在 halt 中产生的持久化副作用 |
+| 失败语义 | `set_maintenance()` 抛错或回读不一致 ⇒ `maintenance_ok=False` ⇒ 继续执行写入封锁（不跳过），封锁确认后仍 `fatal_exit("maintenance_unconfirmed")`；**不得**在维护态未确认时返回正常 `HALTED` |
+| 重启后的判定 | 启动流程先读 `maintenance.json`：存在且 `migration_id` 匹配 ⇒ 进入维护态、业务写入 503；文件缺失但 `schema_migrations` 无 `success` ⇒ 仍按保守恢复处理，**不自动清维护态** |
+
 **halt 的三道拒写机制（不依赖单一内存标记）**
 
 > 记法约定：`EXIT_FATAL` 为非零致命码；`fault_log()` 为文件级 `migration-fault.log` 追加（内部自带异常吞没），`guard_log()` 为其降级包装（文件 → stderr → 丢弃）。
@@ -763,7 +806,7 @@ def set_phase(rec, new, reason) -> PhaseResult:
 | --- | --- | --- | --- |
 | 1 | `rec.halted` 内存闸 | 进程内的 `emit_event` / `append_reason` / `set_phase` 入口，触发 `MigrationHalted` | 仅内存有效，**不足以保证对外拒写**，只作第一道 |
 | 2 | 进程级全局写闸 `WRITES_BLOCKED` + 关闭/摘除全部业务写连接 + 只读连接 `PRAGMA query_only=1` | 所有业务写入口（HTTP 503）与迁移自身写路径 | 无法确认 → 走 `fatal_lockdown` + `fatal_exit`，非零退出 |
-| 3 | maintenance 标记（持久） + `schema_migrations` 无 `success` | 重启后的恢复流程与对外状态 | 置位失败只记故障，但 2 已保证本次进程与连接层拒写；重启后仍无 success、phase 非 COMMITTED |
+| 3 | `maintenance.json` 持久标记（原子写 + 回读验证） + `schema_migrations` 无 `success` | 重启后的恢复流程与对外状态 | 回读失败 ⇒ 不返回正常 `HALTED`；封锁已确认后仍 `fatal_exit("maintenance_unconfirmed")`，由第 2 道保证本次进程拒写 |
 
 **最终业务写入拒绝由第 2 道保证**：`block_business_writes()` 调用后必须 `confirm_writes_blocked()` 回读确认（全局闸已置位 ∧ 写句柄已关闭 ∧ 业务连接均为只读）；确认不成立即视为致命故障，执行 `fatal_lockdown()` 并 `fatal_exit()`，**不得返回一个看起来正常的 `HALTED`**。
 
@@ -776,18 +819,24 @@ def set_phase(rec, new, reason) -> PhaseResult:
 | 结果 | 产生条件 | 内存 phase | 库内事件 | 上层必须做 | 上层禁止 |
 | --- | --- | --- | --- | --- | --- |
 | `SUCCESS` | 事件成功（正常 COMMIT 或 A 采纳）∧ `rec.phase` 落地成功 | 已改 | 已存在且唯一 | 按原成功路径继续（进阶段 C 等） | — |
-| `REJECTED` | 证据不合格（T6 闸），或 `write_event` 返回 B/C（事件未提交） | 未改 | **不存在**（C 情况下也无法确认，但一律不再写） | 走原失败路径（`append_reason` / `handle_post_commit_failure`） | 不得当 HALTED 处理 |
+| `REJECTED` | **仅两种**：证据不合格（T6 闸，INSERT 前拒绝）；或 `write_event` 返回 `ABSENT`（B：确认未提交） | 未改 | 确认不存在 | 走原失败路径（`append_reason` / `handle_post_commit_failure`） | 不得当 HALTED 处理；**不得**用于 C |
+| `HALTED`（C 来源） | `write_event` 返回 `UNRESOLVED`（不可读 / 字段不一致 / 链断裂 / 自相矛盾） | 未改（不可信） | 可能存在、可能断裂 | `halt_tail`：零数据库写入 | 不得降级为 `REJECTED`/`False`/普通失败 |
 | `HALTED` | 事件已确认提交，但 `rec.phase` 落地抛错 | 未改（且不可信） | **已存在且唯一** | `halt_tail(rec)`：保持 maintenance + 封锁、只写非数据库日志、返回 | **不得** `append_reason` / `emit_event` / 任一底层写入 / 第二次转换 / 进阶段 C |
 
 **上层调用链的强制写法（`False` 不再作为唯一信号）**
 
 ```python
 def halt_tail(rec):
-    """HALTED 唯一允许的收尾：零数据库写入。"""
-    rec.halted = True
-    assert rec.maintenance and rec.writes_blocked
+    """HALTED 唯一允许的收尾：零数据库写入。前置条件显式检查（不用 assert）。"""
+    if not getattr(rec, "halt_done", False):          # 防御：未经过 halt 就直接到达这里
+        halt_migration(rec, "halt_tail_without_halt", dict(phase=rec.phase.name))
+    if not (rec.maintenance_ok and rec.writes_blocked):
+        fault_log("halt_tail_precondition_failed",
+                  dict(maint=rec.maintenance_ok, lock=rec.writes_blocked))
+        fatal_lockdown(rec)                           # 保证拒写后再退出
+        fatal_exit(rec, "halt_tail_precondition_failed")   # 不返回、不抛普通异常
     non_db_log("halt_tail_no_db_write", dict(phase=rec.phase.name))
-    return PhaseResult.HALTED          # 继续上行，直到最外层停止迁移
+    return PhaseResult.HALTED
 ```
 
 `emit_event()` 与 `append_reason()` 在入口增加第二道防线：`if rec.halted: raise MigrationHalted(event)` —— 即使上层误写，也只会得到异常，**不会产生任何数据库事件**。
@@ -827,9 +876,9 @@ def halt_tail(rec):
 | 类型 | 落表 | 事件失败时 | 内存 phase | 可否对外作为"已确认状态" |
 | --- | --- | --- | --- | --- |
 | `tx_local` | `migration_tx_notes` | 记日志 | **已改为新值** | **不可**（随迁移事务回滚消失；不进证据链，β′ 不读） |
-| `durable` | `system_events` | 返回 `False`，**不改** | 仍为旧值 | 旧值仍是唯一确认状态 |
-| `durable` 且 T6 证据不全 / `token_fp` 不合格 | `system_events`（无写入） | 返回 `False`，**不写事件** | 仍 `COMMIT_ATTEMPTED` | 旧值仍是唯一确认状态；按 T6′ 处理 |
-| `durable` 且链损坏（C1–C8 任一失败） | `system_events`（无写入） | 返回 `False`，**不补写** | 不推进 | 只写 `migration-fault.log`；maintenance |
+| `durable` 且 B（确认未提交） | `system_events`（无写入） | `WriteOutcome.ABSENT` → `PhaseResult.REJECTED` | 仍为旧值 | 旧值仍是唯一确认状态；可走原失败路径 |
+| `durable` 且 T6 证据不全 / `token_fp` 不合格（INSERT 前） | `system_events`（无写入） | `PhaseResult.REJECTED`，**不写事件** | 仍 `COMMIT_ATTEMPTED` | 旧值仍是唯一确认状态；按 T6′ 处理 |
+| `durable` 且 C（不可读 / 字段不一致 / 链损坏 C1–C8 / 自相矛盾） | `system_events`（无写入） | `WriteOutcome.UNRESOLVED` → `PhaseResult.HALTED` | 不推进 | `halt_migration` 一次 + `halt_tail`；零后续写入；等人工 |
 
 ### 2.2 `COMMITTED` 的五条件门禁（含历史失败门禁）
 
@@ -961,7 +1010,7 @@ elif rec.phase == Phase.UNKNOWN:               # 路径 α 或 β′
 | `UNKNOWN → COMMITTED` 但 **S5 曾失败** | **不允许** | S5 失败意味着"探测时刻存在写者"，token 可见也不足以证明外部世界已稳定 | 保持 `UNKNOWN`，继续保守恢复；不写 success、不开放写入 |
 | `UNKNOWN → TX_ROLLED_BACK` 但 **S5 曾失败** | **不允许**（T8′） | 同源理由：看不到 token 也不能证明外部写者已消失 | 保持 `UNKNOWN`，继续保守恢复 |
 | β′ 的 T7/T8 但 **E1–E3 未通过** | **不允许** | 缺历史 K1 证明或 `s5_failed` 不可恢复时，任何结论都无依据 | 停 `UNKNOWN`；链完整时一条 `evidence_unverified`，链断裂时只写文件日志；不进阶段 C |
-| T6 证据构造失败后的"补写" | **不允许** | 不得只补部分字段、不得跳过校验、不得用 `migration_note` 冒充 T6 | 返回 `False`，停 `COMMIT_ATTEMPTED`，文件日志 |
+| T6 证据构造失败后的"补写" | **不允许** | 不得只补部分字段、不得跳过校验、不得用 `migration_note` 冒充 T6 | `PhaseResult.REJECTED`（INSERT 前拒绝），停 `COMMIT_ATTEMPTED`，文件日志 |
 | `token_fp` 缺失 / 非 64 位 hex / 与凭据行不符 | **不允许**（DB 的 `CHECK(length=64)` + 写入前校验双保险） | 指纹是"迁移身份"的一部分，无法降级 | T6 拒写（`set_phase` 返回 `REJECTED`）；β′ E2 失败 |
 | 事件链 C1–C8 任一失败 | **不允许**追加 | 断链不可自动修复 | 不写事件、不推进 phase、maintenance、只写文件日志 |
 | 写入结果不确定（`COMMIT`/`ROLLBACK`/`close` 抛错） | **不允许重发**同一逻辑事件 | 重发会造成重复 `seq` / 分叉链 | 独立只读连接重查：A（一致且链通过）采纳并按成功推进；B（确认不存在）返回失败、不推进；C（不可读/不一致/链断裂）停 maintenance、只写文件日志 |
@@ -969,6 +1018,9 @@ elif rec.phase == Phase.UNKNOWN:               # 路径 α 或 β′
 | 只读重查不可用（`SQLITE_BUSY`/文件不可读/连接失败） | **不允许解释为"事件不存在"** | 把查询失败当未提交会造成"库里已有事件、再走另一条转换" | 判 C：maintenance 保持、不重发、不开放写入 |
 | C 类结果被压缩成 `REJECTED` | **不允许** | C 意味着"库里可能有事件、也可能有断裂"，按普通失败继续写 note 会在不可信链上追加 | `WriteOutcome.UNRESOLVED` → `PhaseResult.HALTED`；note 的 C 类经 `note_or_stop` 直接 `halt_tail` |
 | C 类结果再次调用 `halt_migration` | **不允许** | `write_event` 已调用；重复调用会重复置位/重复日志，掩盖首次故障 | `halt_migration` 幂等 + `set_phase` 只做映射 |
+| maintenance 持久化失败仍返回正常 `HALTED` | **不允许** | 重启后无法识别维护态，业务写入可能恢复 | `verify_maintenance()` 回读确认；未确认 ⇒ `fatal_exit("maintenance_unconfirmed")`，非零退出 |
+| maintenance 与业务库同库存储 | **不允许** | halt 期间禁止数据库写入，同库存储会自相矛盾 | 独立 `STATE_DIR/maintenance.json`，原子 rename + fsync + 回读 |
+| `halt_tail` 用 `assert` 承担前置检查 | **不允许** | 优化模式会裁剪 assert，安全检查失效 | 显式 `if not (maintenance_ok and writes_blocked)` → `fatal_lockdown` + `fatal_exit` |
 | halt 中某保护动作失败后跳过其余动作 | **不允许** | 跳过封锁会让业务写入继续可用 | 三个动作各自独立 `try`；封锁失败 → `fatal_lockdown` + `fatal_exit` |
 | 封锁未确认仍返回正常 `HALTED` | **不允许** | 返回"正常"会让上层以为已安全封锁 | `confirm_writes_blocked()` 回读确认；不成立即致命路径、非零退出 |
 | `HALTED` 被上层转成"事件失败"继续写 note | **不允许** | `HALTED` 意味着库内已有本次事件，追加 note 会掩盖事实并与人工恢复冲突 | 三态结果 + `halt_tail` 零写入 + `emit_event`/`append_reason` 的 `rec.halted` 拒写闸 |
@@ -993,7 +1045,7 @@ elif rec.phase == Phase.UNKNOWN:               # 路径 α 或 β′
 
 三者必须一致：`COMMITTED` 出现在内存与事件中 ⇒ `enter_phase_c` 被调用一次；事件里没有 `COMMITTED` ⇒ 内存不得为 `COMMITTED` ⇒ 未进入阶段 C ⇒ 无 success、写入仍关闭。
 
-### 2.5 测试（PH9–PH11、PH9b、PH10b + MC19–MC21 + MC38–MC62）
+### 2.5 测试（PH9–PH11、PH9b、PH10b + MC19–MC21 + MC38–MC64）
 
 | # | 初始 | 步骤 | 预期 |
 | --- | --- | --- | --- |
@@ -1009,13 +1061,13 @@ elif rec.phase == Phase.UNKNOWN:               # 路径 α 或 β′
 | MC40 | 已持久化 `s5_failed_ever=true` | 直接调 `write_event`/`append_reason` 要求写 `false` | 抛 `EvidenceMonotonicityViolation`；事务回滚；DB 无新行；`rec.s5_failed_ever` 仍 `true`；`phase` 不变；只落文件日志 |
 | MC41 | 两个写入者并发追加事件（线程/进程各一，均走统一入口） | 同时开始写 | 无重复 `seq`（`UNIQUE(migration_id,seq)` 兜底）、无分叉 `prev_sha`（`UNIQUE(migration_id,prev_sha)` 兜底）；失败方得到写失败、不重试、不推进 phase；成功方序严格连续；`s5_failed_ever` 不倒退 |
 | MC42 | 人为制造链断裂（删除中间事件 / 篡改 `prev_sha` / 改 `seq`）后追加 `migration_note(evidence_unverified)` | 观察 | **不写** DB note；不重建、不覆盖、不重算历史；只写 `migration-fault.log`；`phase` 不变；无 success |
-| MC43 | T6 证据构造失败（缺 `k1_proof` 字段 / 布尔不全 true / `s5_result=not_run` / `token_fp` 缺失 / `token_fp` 非 64 位 hex / `token_fp` 与凭据行不符，逐一构造） | 调 `set_phase(COMMIT_ATTEMPTED→UNKNOWN)` | 每种都返回 `False`；**DB 无 T6 行**（`SELECT count(*)` 为 0）；内存仍 `COMMIT_ATTEMPTED`；不开放写入；文件日志记录对应缺失项 |
+| MC43 | T6 证据构造失败（缺 `k1_proof` 字段 / 布尔不全 true / `s5_result=not_run` / `token_fp` 缺失 / `token_fp` 非 64 位 hex / `token_fp` 与凭据行不符，逐一构造） | 调 `set_phase(COMMIT_ATTEMPTED→UNKNOWN)` | 每种都返回 `PhaseResult.REJECTED`（不是 `HALTED`，因为属 INSERT 前拒绝，`halt_migration` 计数 0）；**DB 无 T6 行**（`SELECT count(*)` 为 0）；内存仍 `COMMIT_ATTEMPTED`；不开放写入；文件日志记录对应缺失项 |
 | MC44 | 路径 α：T6 时 S5 失败（`s5_failed_ever=true` 已落库），随后同一进程 S5 探测成功且 token 可见 | 走 §2.2 门禁 | `hist_gate=False` → **禁止 T7**；DB 无 `→COMMITTED` 行；一条 `historical_s5_failure` note（`s5_failed_ever` 仍为 1）；未进阶段 C；无 success |
 | MC45 | 路径 α：同上，但 token 与迁移对象均不可见 | 走 §2.2 门禁 | `hist_gate=False` → **禁止 T8**（T8′）；DB 无 `→TX_ROLLED_BACK` 行；`s5_failed_ever` 仍为 1；未进阶段 C；无 success |
 | MC46 | 路径 β′：真实重启，事件列恢复 `s5_failed_ever=1` | 分别构造 token 可见 / 均不可见 | 前者 T7 被禁止；后者 T8 被禁止；两者均停 `UNKNOWN`；无 success；maintenance 保持 |
 | MC47 | 已 `s5_failed_ever=1`；分别构造：① 合法 `probe_ok`（`s5_result="ok"`、`s5_failed_ever` 沿用 1）② 带清除语义的 `probe_ok`（`s5_failed_ever=false` / `clear=true`） | 走 `write_event` / `emit_event` | ① 正常写入（列值仍 1，历史不被清除）② 拒写（`EvidenceMonotonicityViolation`），**DB 实际查验**：无新行、`SELECT MAX(s5_failed_ever)` 仍为 1、已有行该字段仍 true；只落文件日志 |
 | MC48 | `INSERT` 真实成功、`COMMIT` 真实提交后，注入驱动层抛错（等价于"提交成功但未收到确认"） | 触发 `write_event` 异常分支；随后用 `mode=ro` 独立连接读取 `system_events` | 走 A：目标 `seq` 行存在、8 字段逐项一致、C1–C8 通过 → 采纳并返回 `True`；`set_phase` 推进 phase；**DB 中该 `seq` 只有一行**（对比写入前后 `count(*)`，无第二次 `INSERT`）；`rec.s5_failed_ever` 与列值一致 |
-| MC49 | `INSERT` 后 `COMMIT` 未成功（在 `COMMIT` 前断连/注入失败） | 同上重查 | 走 B：链尾 `seq < 目标 seq` 或无行且 `seq=1` → 返回 `False`；`rec.phase` 不变；DB 无目标行；`rec.s5_failed_ever` 未被提前更新 |
+| MC49 | `INSERT` 后 `COMMIT` 未成功（在 `COMMIT` 前断连/注入失败） | 同上重查 | 走 B：链尾 `seq < 目标 seq` 或无行且 `seq=1` → `WriteOutcome.ABSENT` → `PhaseResult.REJECTED`；`rec.phase` 不变；DB 无目标行；`rec.s5_failed_ever` 未被提前更新 |
 | MC50 | `COMMIT` 抛错后，只读重查不可用（库被独占锁 / 文件权限收回 / 连接失败） | 注入只读连接失败 | 走 C：`halt_migration`；maintenance 保持；无第二次写入尝试（`INSERT` 调用计数 == 1）；业务写入 503；`migration-fault.log` 有 `reconcile_unreadable`；**不把查询失败当成"不存在"** |
 | MC51 | 目标 `seq` 行存在，但 `event` / `detail_json` / `token_fp` / `prev_sha` / `ts` 中任一项与本次预期不同（逐项各构造一例） | 重查 | 走 C：`MISMATCH` → 不采纳、不推进 phase、不开放写入、停 maintenance；DB 该行保持被改动后的原样，**不被覆盖或修正** |
 | MC52 | ① `ROLLBACK` 抛错而事件实际已提交 ② `ROLLBACK` 抛错而事件确实未提交 ③ `close` 抛错而事件已提交 ④ `close` 抛错而事件未提交 | 四种组合分别构造，逐一读取 DB 实际行 | ①②③④ 均以持久化行为准：已提交 → 采纳（A）、无行 → 失败（B）；**不得依据异常类型猜测**；无重复 `seq`、无分叉链 |
@@ -1025,11 +1077,13 @@ elif rec.phase == Phase.UNKNOWN:               # 路径 α 或 β′
 | MC56 | durable 事件（T6/T7/T8/note） | 观察 `write_event` 内部 | 仍在 `BEGIN IMMEDIATE` 内执行 C1–C8 全链校验后才 `INSERT`；`emit_event` 未提供任何绕过路径；人为断链后经 `emit_event` 追加仍被拒（只写文件日志） |
 | MC57 | 逐条触发 T1、T2、T3、T4、T5、T6、T7、T8 与 `migration_note`；另构造非法输入：未登记事件名、`(old,new)` 不在 `LEGAL_TRANSITIONS`、`old != rec.phase`、`detail` 自带 `durability`、`(old,new)` 不在 `TRANSITION_DISPATCH` | 打桩记录 `emit_event` 入口、`TRANSITION_DISPATCH` 命中键与后端函数调用 | T1/T2 → `write_tx_event`，行落 `migration_tx_notes`（`system_events` 无对应行）；T3–T8 与 note → `write_event`，行落 `system_events` 且链通过 C1–C8；五种非法输入全部抛异常且 **零写入**；两个后端函数的直接调用点仅存在于 `emit_event` 内部（静态断言 + 调用计数） |
 | MC58 | 事件已真实提交（`set_phase` 走到 `commit_phase_in_memory`），在该窗口注入 `rec.phase = new` 抛错 | 注入异常，随后重启进程读取 DB 与 maintenance 标记 | `halt_migration` 被调用一次；maintenance 保持；`migration-fault.log` 有 `phase_commit_window_failed`；`system_events` 中该事件**仍存在且唯一**（写入前后 `count(*)` 不变、无第二次 `INSERT`）；无第二次状态转换（事件序列里无额外 `migration_phase`）；未进入阶段 C、无 success、写入 503 |
-| MC59 | 同 MC58，但分别用 `rollback_for_migration` 抛错、`close` 抛错、`emit_event` 返回 `False` 三种对照 | 对照观察错误归类 | phase 落地异常 ⇒ 归 `phase_update_after_committed_event`（halt），**不归** `event_write_failed`；事件不重发（`INSERT` 计数 == 1）；`emit_event` 返回 `False` ⇒ 归 B/C 正常失败路径、不 halt；两类日志码不互相出现 |
+| MC59 | 同 MC58，另加三种对照：`rollback_for_migration` 抛错、`close` 抛错、`emit_event` 分别返回 `ABSENT` 与 `UNRESOLVED` | 对照观察错误归类 | 落地异常 ⇒ `phase_update_after_committed_event`（halt），**不归** `event_write_failed`；事件不重发（`INSERT` 计数 == 1）；`ABSENT` ⇒ `REJECTED` 且不 halt；`UNRESOLVED` ⇒ `HALTED` 且 halt 计数 1；三类日志码互斥 |
 | MC60 | 事件真实提交成功后注入 `rec.phase` 落地异常，完整执行 §2.2 上层调用流程（β 与 α 各一次） | 读 DB + 打桩记录 `halt_migration` / `INSERT` / `append_reason` / `enter_phase_c` 计数 | `halt_migration` 调用**一次**（重复调用为 no-op）；上层收到 **`HALTED`**（不是 `False`/`REJECTED`），且 `halt_tail` 未产生任何 DB 写；`system_events` 写入前后 `count(*)` **完全一致**；原事件存在且唯一；无新 `migration_note`、无第二条 `migration_phase`；`INSERT` 调用次数 == **1**；未进阶段 C；`schema_migrations` 无 success；maintenance 保持、业务写入 503；halt 之后无任何数据库写入（用连接级写计数断言） |
 | MC60b（对照） | 普通 B 类：`COMMIT` 未成功、重查确认目标行不存在 | 同上层流程 | 返回 `REJECTED`；**不触发** `halt_migration`（调用计数 0）；按原失败路径写一条 `migration_note`；`rec.halted == False`；maintenance 未被置位（按原设计走保守恢复） |
 | MC61 | 分别注入 A（已提交）、B（确认未提交）、C（不可读/字段不一致/链断裂）三类，完整走 `write_event → emit_event → set_phase → 上层` | 读真实 DB + 打桩计数 | A：`SUCCESS` → 进阶段 C；若同时注入落地异常则 `HALTED` → `halt_tail`。B：`REJECTED`，`halt_migration` 计数 **0**，按原路径一条 note。C：`HALTED`（**不得**是 `REJECTED`），`halt_migration` 计数 **1**（不重复），**无额外 `migration_note`**、无第二次 `INSERT`、`system_events` 行数不变；上层进 `halt_tail`、未进阶段 C、无 success、503 |
-| MC62 | 注入 `set_maintenance()` 抛错；`block_business_writes()` 抛错；`non_db_log()` 抛错；三者同时抛错 | 观察每个动作是否仍被尝试 | 每个动作都有独立日志码（`halt_maintenance_failed` / `halt_write_lock_failed` / `halt_log_failed`，日志自身失败再降级 stderr）；后续动作**仍被执行**；`fatal_lockdown` 与 `fatal_exit` 在封锁未确认时触发，退出码非零；`halt_migration` 不抛出、不冒泡为"事件写入失败"；**零数据库写入**（连接级计数）；不返回 `SUCCESS`/`REJECTED` |
+| MC62 | 注入 `set_maintenance()` 抛错；`block_business_writes()` 抛错；`non_db_log()` 抛错；三者同时抛错 | 观察每个动作是否仍被尝试、最终去向 | 每个动作都有独立日志码（`halt_maintenance_failed` / `halt_write_lock_failed` / `halt_log_failed`，日志自身失败再降级 stderr）；后续动作**仍被执行**；`maintenance_ok=False` 时**不得**正常返回 `HALTED`，封锁确认后仍 `fatal_exit("maintenance_unconfirmed")`；封锁未确认时 `fatal_lockdown` + `fatal_exit`；退出码非零；`halt_migration` 不抛出、不冒泡为"事件写入失败"；**零数据库写入**（连接级计数）；不返回 `SUCCESS`/`REJECTED` |
+| MC63 | `set_maintenance()` 抛错，但 `block_business_writes()` 与 `confirm_writes_blocked()` 成功 | 走完整 halt → `halt_tail` 链路；读文件、DB、退出码 | 封锁动作仍被执行且回读确认；`maintenance_ok=False`；**不返回正常 `HALTED`**（`fatal_exit("maintenance_unconfirmed")`，退出码非零）；`halt_tail` 前置检查不因 `assert` 产生未处理异常（改为显式检查 + 致命路径）；`maintenance.json` 不存在或内容不匹配时**不误报为 true**；无 `migration_note`、无第二次 `INSERT`、无 success；业务写入 503（由封锁保证） |
+| MC64 | ① 持久化成功但回读失败（改 `nonce` / 改 `phase` / 截断文件） ② 持久化失败（`os.replace` 抛错 / 目录只读）且回读失败 | 分别验证 | 两种都 `maintenance_ok=False`、不误报成功、不返回虚假 `HALTED`；封锁确认后 `fatal_exit("maintenance_unconfirmed")`；封锁无法确认则 `fatal_lockdown` + `fatal_exit("writes_block_unconfirmed")`；`guard_log` 降级链有效（文件失败 → stderr 有输出）；halt 之后数据库写入次数 == 0（连接级计数） |
 
 
 ---
@@ -1323,6 +1377,10 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 >
 > **C 不得降级**：`write_event` 返回 `UNRESOLVED` 时已 `halt_migration`，`set_phase` 只做 `UNRESOLVED → HALTED` 映射；`migration_note` 的 C 类经 `note_or_stop` 直接 `halt_tail`。
 >
+> **映射唯一口径**：`COMMITTED(A) → SUCCESS`（且内存落地成功）；`ABSENT(B) → REJECTED`；`UNRESOLVED(C) → HALTED`；`LOCAL(L)` 只用于 tx_local，**不参与**任何 durable 状态判断。`REJECTED` 只覆盖 B 与 INSERT 前证据不合格，C 在任何函数、表格、测试、上层分支中都不得降级。
+>
+> **`HALTED` 上行前置**：`halt_migration` 只有在 `maintenance_ok ∧ writes_blocked` 都回读确认时才正常返回；否则 `fatal_exit` 非零退出。`halt_tail` 用显式检查（非 `assert`）复核，失败即 `fatal_lockdown` + `fatal_exit`。
+>
 > **"事件失败"仅指 B（确认未提交）与 T6 式证据缺失**：A（重查确认已提交）按成功路径推进；C（无法确认）不推进且停 maintenance——三者不得混同，也不得用异常类型代替重查。
 >
 > **S2 异常不产生任何转换**：属性读、隔离、回滚三段中的任一抛错，都只写 `migration-fault.log`；`phase` 仍为 `COMMIT_ATTEMPTED`。若隔离确认且关闭成功 → 走 T6 写 `→UNKNOWN`；否则走 T6′（无转换）。
@@ -1362,7 +1420,7 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | 要求 | 落实 |
 | --- | --- |
 | 两类确认语义 | §2.1 表：durable 失败不改内存；tx_local 改了但非权威 |
-| 事件失败不得对外使用新状态 | `set_phase` 返回 `REJECTED`，`rec.phase` 仍旧值 |
+| 未提交/证据不合格不得对外使用新状态 | `set_phase` 返回 `REJECTED`（仅 B 与 INSERT 前证据不合格），`rec.phase` 仍旧值 |
 | COMMITTED 四条件 | §2.2 门禁（token/终止证据/K2/事件） |
 | 门禁编号按 phase 唯一决定 | §2.2 `COMMIT_ATTEMPTED → T4`，`UNKNOWN → T7`，不可互换 |
 | 门禁失败不回退到 UNKNOWN | §2.3：`COMMIT_ATTEMPTED→UNKNOWN` 只由 T6 触发 |
@@ -1462,6 +1520,8 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | halt 上行传递（十一次） | `PhaseResult` 三态（`SUCCESS`/`REJECTED`/`HALTED`）取代裸 `bool`；`halt_tail` 零写入；`emit_event`/`append_reason` 在 `rec.halted` 时拒写 | §2.1 / §2.2 分派表 | MC60/MC60b |
 | C 类不降级（十二次） | `WriteOutcome`（COMMITTED/ABSENT/UNRESOLVED/LOCAL）取代裸 bool；`set_phase` 对 `UNRESOLVED` 只映射为 `HALTED`，不重复 halt；`note_or_stop` 处理 note 的 C 类 | §2.1 / §2.2 | MC61 |
 | halt 故障安全（十二次） | 三个保护动作独立 `try` + `guard_log` 三层降级 + `confirm_writes_blocked` + `fatal_lockdown`/`fatal_exit` | §2.1 halt 伪代码 + 三道拒写机制表 | MC62 |
+| A/B/C 语义统一（十三次） | 全篇统一映射；清除 §1.4「False」、§2.1 语义对照中的 False、MC43 的 False 断言 | §1.4 / §2.1 / §2.2 / §2.3 / §2.5 / §8 | MC43/MC49/MC61 |
+| maintenance 一致性（十三次） | `maintenance.json` 原子写 + `verify_maintenance` 回读；未确认即 `fatal_exit`；`halt_tail` 显式检查 | §2.1 持久化契约表 | MC63/MC64 |
 
 ## 7. 测试矩阵（增量）
 
@@ -1477,7 +1537,7 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | RC | 6 | 6 | — |
 | CF | 8 | 8 | — |
 | AU | 9 | 9 | — |
-| MC | 12 | **62** | +MC13–MC18；二次修订 +MC19–MC20；三次修订 +MC21、MC15b/15c/15d、MC13b；四次修订 +MC22–MC24；五次修订 +MC25/MC26/MC26b/MC27/MC27b；六次修订 +MC34–MC37；七次修订 +MC38–MC43；八次修订 +MC44–MC47；九次修订 +MC48–MC56；十次修订 +MC57–MC59；十一次修订 +MC60（含对照 MC60b）；十二次修订 +MC61–MC62 |
+| MC | 12 | **64** | +MC13–MC18；二次修订 +MC19–MC20；三次修订 +MC21、MC15b/15c/15d、MC13b；四次修订 +MC22–MC24；五次修订 +MC25/MC26/MC26b/MC27/MC27b；六次修订 +MC34–MC37；七次修订 +MC38–MC43；八次修订 +MC44–MC47；九次修订 +MC48–MC56；十次修订 +MC57–MC59；十一次修订 +MC60（含对照 MC60b）；十二次修订 +MC61–MC62；十三次修订 +MC63–MC64（MC62 语义收紧） |
 | CR | 5 | 5 | — |
 | FX | 3 | **4** | +FX4 |
 | PH | 5 | **13** | +PH6–PH11、PH9b、PH10b |
@@ -1543,7 +1603,7 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | 写入结果不确定不重发 | 只读重查 + 不重试 | §2.1 `settle_uncertain` / 三结果表 | MC48–MC53 |
 | `COMMIT` 抛错后真正重查 | `except` → `exp`(8 字段) → `reconcile_event()` → A/B/C | §2.1 伪代码（不是规则表） | MC48/MC49/MC51 |
 | 事件已提交不误判"未提交" | A 路径返回 `True`，`set_phase` 按成功推进 | §2.2 成功/失败语义表 | MC48/MC52/MC53 |
-| 事件未提交不推进 phase | B 路径返回 `False`，内存不动 | §2.2 表 / §2.3 | MC49/MC52 |
+| 事件未提交不推进 phase | B 路径 `WriteOutcome.ABSENT` → `REJECTED`，内存不动 | §2.2 表 / §2.3 | MC49/MC52 |
 | 不可读不解释为不存在 | `UNREADABLE` 属 C，停 maintenance | §2.1 三结果表 | MC50 |
 | 单一事件入口 | `set_phase` 两支 + `append_reason` 均调 `emit_event` | §2.1 / §1.2 | MC54/MC55/MC56 |
 | 分派按转换键而非事件名 | `TRANSITION_DISPATCH[(old,new)]` + `_assert_dispatch_invariants()` | §2.1 分派表 / 转换→后端表 | MC57 |
@@ -1558,6 +1618,10 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | note 的 C 类不绕过 | `note_or_stop` → `halt_tail` | §2.2 | MC61 |
 | halt 三个动作独立保护 | 各自 `try` + `guard_log` | §2.1 | MC62 |
 | 封锁未确认即致命 | `confirm_writes_blocked` + `fatal_exit` | §2.1 三道机制表 | MC62 |
+| 语义映射全篇唯一 | `A→SUCCESS`/`B→REJECTED`/`C→HALTED`/`L` 仅 tx_local | §1.4 / §2.1 / §2.2 / §2.3 | MC43/MC49/MC61 |
+| 无裸 `False` 断言残留 | 全文检索 `返回 False` 已清零（仅存于历史说明） | §2.5 / §8 | MC43 |
+| maintenance 持久化可回读 | `maintenance.json` 原子 rename + `verify_maintenance` | §2.1 契约表 | MC63/MC64 |
+| `halt_tail` 不依赖 assert | 显式检查 + `fatal_exit` | §2.2 | MC63 |
 | 独立夹具 | §4.2 | — | FX4/R10-A0/A1/A2 |
 
 **九次修订的八项全篇核对（本轮必须逐条过）**
@@ -1634,7 +1698,10 @@ VALUES (1, 'F1', 11, 1, 'available', 0);
 | 34 | C 类被压成 REJECTED → 在不可信链上继续写 note，掩盖"可能有事件" | `WriteOutcome` 四态 + `set_phase` 只做映射 | MC61 |
 | 35 | halt 中前一动作抛错跳过封锁 → 业务写入继续可用 | 三动作独立 `try`；封锁未确认 → `fatal_lockdown`+`fatal_exit` | MC62 |
 | 36 | 只靠 `rec.halted` 拒写（重启或跨进程失效） | 三道机制：内存闸 / 进程写闸+只读连接 / maintenance + 无 success | MC62 |
+| 37 | 旧语义残留（C 被写成 REJECTED/False）→ 实施时再次降级 | 全篇统一映射表 + 全文检索清零裸 `False` | MC43/MC61 |
+| 38 | `set_maintenance` 失败但封锁成功 → `halt_tail` 断言崩溃 | maintenance 未确认即 `fatal_exit`；`halt_tail` 显式检查 | MC63/MC64 |
+| 39 | maintenance 与业务库同库 → halt 期间无法持久化 | 独立 `STATE_DIR/maintenance.json` 原子写 + 回读 | MC64 |
 
 ---
 
-**v1.10 到此结束。** 十二次修订合计**未编写代码、未执行迁移、未修改数据库、未修改生产配置或生产数据**；十二次修订累计只处理"五项 + 两项 + 三项 + S2 异常保护 + 路径与关闭接口一致性 + β′ 跨重启证据 + 证据写入路径 + 证据完整性 + 提交结果确认 + 转换级分派与 phase 落地窗口 + halt 上行传递 + C 类不降级与 halt 故障安全"的状态机与伪代码矛盾。**C11–C20 全部未确认，C12 仍未被本轮视为已批准。** 文档交回总体设计最终审查；未获批准前不提交 P-1 实施计划、不进入任何实施阶段。
+**v1.10 到此结束。** 十三次修订合计**未编写代码、未执行迁移、未修改数据库、未修改生产配置或生产数据**；十三次修订累计只处理"五项 + 两项 + 三项 + S2 异常保护 + 路径与关闭接口一致性 + β′ 跨重启证据 + 证据写入路径 + 证据完整性 + 提交结果确认 + 转换级分派与 phase 落地窗口 + halt 上行传递 + C 类不降级与 halt 故障安全 + 语义统一与 maintenance 持久化一致性"的状态机与伪代码矛盾。**C11–C20 全部未确认，C12 仍未被本轮视为已批准。** 文档交回总体设计最终审查；未获批准前不提交 P-1 实施计划、不进入任何实施阶段。
