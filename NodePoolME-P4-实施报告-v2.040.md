@@ -201,7 +201,17 @@ P4 专项覆盖：质量与成熟度分离、未成熟观察不零分、Unknown 
 - 移动端节点详情：`nodepool-p4-mobile-drawer.png`
 - 参数设置：`nodepool-p4-settings.png`
 
-桌面表格已压缩列宽并取消固定列，避免右侧重叠；移动端 10 项导航与卡片布局均可用。
+桌面表格已压缩列宽并取消固定列，避免右侧重叠；移动端 10 项导航与卡片布局均可用。截图已按 v2.040 三时段加权可用率重新生成。
+
+### 5. 提交与发布
+
+- 修正提交：`ed5b190 fix(P4): band-weighted availability, complete speed bytes and fixed schedule (v2.040)`
+- 版本标签：`v2.040`
+- GitHub Actions：`46110341639`（tag v2.040，success）、`46110336390`（main，success）
+- Release：`https://github.com/laoXuHome/NodePoolME/releases/tag/v2.040`
+- 离线包：`https://github.com/laoXuHome/NodePoolME/releases/download/v2.040/nodepoolme-v2.040-offline-amd64.tar.gz`（amd64，84.5 MB）
+- SHA256：`c622d3623fb57ead36eb11c2e4754b48798f8104bd636bca326eb9f0a6fc10fe`
+- 文档发布仓库：`laoXuHome/laoXuHome` 提交 `0c2feb1`
 
 ## 七、阶段边界确认
 
